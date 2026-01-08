@@ -1,24 +1,13 @@
-# IA Resumen Credicoop (AIE San Justo)
+# IA Resumen Credicoop
 
-Aplicación Streamlit para procesar resúmenes bancarios de Banco Credicoop en PDF.
+App Streamlit para procesar Resumen de Cuenta Corriente Comercial (Banco Credicoop).
 
-## Qué hace
+## Reglas implementadas
+- Movimiento = línea con FECHA; líneas siguientes sin fecha se concatenan.
+- Si hay 2 importes en una línea, el de la derecha es SALDO diario (se ignora).
+- Débito a la izquierda; Crédito a la derecha.
+- Conciliación estricta: Saldo anterior + Créditos - Débitos = Saldo AL (fecha).
+- Parser híbrido: CHARS y OCR; se elige el modo que mejor concilia.
 
-- Extrae movimientos desde la tabla **FECHA / COMBTE / DESCRIPCION / DEBITO / CREDITO / SALDO**
-- Calcula conciliación **estricta**: `Saldo anterior + Créditos − Débitos = Saldo al <fecha>`
-- Toma el saldo **solo** de:
-  - `SALDO ANTERIOR` (inicial)
-  - `SALDO AL <dd/mm/aa|aaaa>` (final)
-- Genera **Resumen Operativo** (comisiones, IVA, Ley 25.413, etc.)
-- Detecta y lista **Préstamos** (si aparecen) y **Créditos no préstamo**
-- Exporta **Excel** y **PDF** (Resumen Operativo)
-
-## Lectura
-
-1. Intenta lectura por **CHARS** (texto real del PDF).
-2. Si el PDF es escaneado o no trae texto utilizable, cae a **OCR** automáticamente.
-
-## Requisitos
-
-- Python 3.12 (ver `runtime.txt`)
-- `tesseract-ocr` y `tesseract-ocr-spa` (ver `packages.txt`)
+## Deploy
+Subir este repo a Streamlit Cloud. Entry point: `streamlit_app.py`.

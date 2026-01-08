@@ -3,50 +3,63 @@ import re
 import pandas as pd
 import streamlit as st
 import pdfplumber
-import xlsxwriter
+import numpy as np
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Conciliador Credicoop AIE", layout="wide")
-st.title("🏦 Conciliador Credicoop - Procesamiento por Registros")
+st.set_page_config(page_title="IA Resumen Credicoop", layout="wide")
+st.title("🏦 IA Resumen Credicoop (Corregido y Conciliado)")
 
-def limpiar_monto(texto):
-    if not texto: return 0.0
-    aux = re.sub(r'[^\d,\-]', '', str(texto))
-    if not aux: return 0.0
-    aux = aux.replace('.', '').replace(',', '.')
-    try: return float(aux)
+# --- UTILIDADES ---
+def fmt_ar(n):
+    if n is None or np.isnan(n): return "—"
+    return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+def normalize_money(text):
+    if not text: return 0.0
+    s = str(text).replace(" ", "").replace("−", "-").replace(".", "").replace(",", ".")
+    try: return float(s)
     except: return 0.0
 
-# --- PROCESADOR ---
-def procesar_banco(file_bytes):
-    movimientos = []
-    current_mov = None
-    saldo_inicial = 0.0
-    saldo_final = 0.0
-    texto_total = ""
+def clasificar(desc):
+    n = desc.upper()
+    if "25413" in n: return "Ley 25.413" [cite: 82, 180]
+    if "IVA" in n:
+        if "10,5" in n: return "IVA 10,5%" [cite: 87]
+        return "IVA 21%" [cite: 70]
+    if "PERCEP" in n: return "Percepciones" [cite: 78, 99]
+    if any(k in n for k in ["COMISION", "SERVICIO", "MANTEN", "GASTO"]): return "Gastos Bancarios (Neto)" [cite: 70, 78]
+    if any(k in n for k in ["PRESTAMO", "CUOTA", "AMORT"]): return "Préstamos" [cite: 28, 70]
+    return "Otros"
 
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        # 1. Definir coordenadas de columnas (Basado en Página 1)
+# --- PROCESAMIENTO ---
+def parse_credicoop_estricto(pdf_bytes):
+    rows = []
+    saldo_anterior = 0.0
+    saldo_final = 0.0
+    current_row = None
+    full_text = ""
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # Detectar límites de columnas en página 1
         p1 = pdf.pages[0]
         words = p1.extract_words()
-        # Valores de seguridad por si no detecta encabezados
-        limite_deb_cre = 460 
-        limite_cre_sal = 540
+        # Coordenadas X promedio para Credicoop
+        limite_deb_cre = 455 
+        limite_cre_sal = 535
 
-        deb_head = next((w for w in words if "DEBITO" in w['text'].upper()), None)
-        cre_head = next((w for w in words if "CREDITO" in w['text'].upper()), None)
-        if deb_head and cre_head:
-            limite_deb_cre = (deb_head['x1'] + cre_head['x0']) / 2
-            limite_cre_sal = cre_head['x1'] + 30
+        deb_h = next((w for w in words if "DEBITO" in w['text'].upper()), None) [cite: 17, 158]
+        cre_h = next((w for w in words if "CREDITO" in w['text'].upper()), None) [cite: 17, 158]
+        if deb_h and cre_h:
+            limite_deb_cre = (deb_h['x1'] + cre_h['x0']) / 2
+            limite_cre_sal = cre_h['x1'] + 35
 
-        # 2. Procesar todas las páginas
         for page in pdf.pages:
-            texto_total += (page.extract_text() or "") + "\n"
-            words = page.extract_words(x_tolerance=2, y_tolerance=3)
+            full_text += (page.extract_text() or "") + "\n"
+            p_words = page.extract_words(x_tolerance=2, y_tolerance=3)
             
             # Agrupar por líneas
             lines = {}
-            for w in words:
+            for w in p_words:
                 y = round(w['top'])
                 if y not in lines: lines[y] = []
                 lines[y].append(w)
@@ -55,91 +68,105 @@ def procesar_banco(file_bytes):
                 line_words = sorted(lines[y], key=lambda w: w['x0'])
                 line_text = " ".join([w['text'] for w in line_words])
                 
-                # Check Fecha (dd/mm/yy)
+                # REGLA: La fecha marca el nuevo registro 
                 match_fecha = re.match(r"^(\d{2}/\d{2}/\d{2,4})", line_text)
                 
                 if match_fecha:
-                    # Guardar el movimiento anterior si existe
-                    if current_mov: movimientos.append(current_mov)
-                    
-                    # Iniciar nuevo movimiento
-                    current_mov = {
-                        "Fecha": match_fecha.group(1),
-                        "Descripción": "",
-                        "Débito": 0.0,
-                        "Crédito": 0.0
+                    if current_row: rows.append(current_row)
+                    current_row = {
+                        "fecha": match_fecha.group(1),
+                        "descripcion": "",
+                        "debito": 0.0,
+                        "credito": 0.0,
+                        "clasificacion": ""
                     }
-                    rest_of_words = line_words
+                    words_to_proc = line_words
                 else:
-                    rest_of_words = line_words
+                    words_to_proc = line_words
 
-                if current_mov:
-                    for w in rest_of_words:
+                if current_row:
+                    for w in words_to_proc:
                         txt = w['text']
-                        x_mid = (w['x0'] + w['x1']) / 2
+                        x_center = (w['x0'] + w['x1']) / 2
                         
-                        # Es un monto?
+                        # Si es un monto (formato 1.234,55)
                         if re.match(r"^-?[\d\.]+,[\d]{2}$", txt):
-                            val = limpiar_monto(txt)
-                            if x_mid < limite_deb_cre:
-                                current_mov["Débito"] += val
-                            elif x_mid < limite_cre_sal:
-                                current_mov["Crédito"] += val
+                            val = normalize_money(txt)
+                            if x_center < limite_deb_cre:
+                                current_row["debito"] += val
+                            elif x_center < limite_cre_sal:
+                                current_row["credito"] += val
+                            # Ignoramos la columna Saldo (derecha) 
                         else:
-                            # Es texto de descripción
-                            if txt not in current_mov["Fecha"]:
-                                current_mov["Descripción"] += " " + txt
+                            # Concatenar descripción (evitando repetir la fecha)
+                            if txt not in current_row["fecha"]:
+                                current_row["descripcion"] = (current_row["descripcion"] + " " + txt).strip()
 
-                # Captura de Saldo Anterior
-                if "SALDO ANTERIOR" in line_text.upper():
-                    m = re.search(r"([\d\.]+,[\d]{2})", line_text)
-                    if m: saldo_inicial = limpiar_monto(m.group(1))
+        if current_row: rows.append(current_row)
 
-        if current_mov: movimientos.append(current_mov)
-
-        # 3. Saldo Final y Cuadro de Impuestos (Regex al texto total)
-        m_fin = re.search(r"SALDO AL \d{2}/\d{2}/\d{2,4}\s+([\d\.,\-]+)", texto_total)
-        saldo_final = limpiar_monto(m_fin.group(1)) if m_fin else 0.0
+        # Capturar Saldos y Cuadro Final
+        match_ant = re.search(r"SALDO ANTERIOR\s+([\d\.,\-]+)", full_text) [cite: 17, 158]
+        if match_ant: saldo_anterior = normalize_money(match_ant.group(1))
         
-        # Extraer totales del cuadro del banco
-        impuestos = []
-        tags = [("TOTAL IMPUESTO LEY 25413", "Ley 25.413"), ("IVA ALIC ADIC RG 2408", "Percep. IVA"), ("IVA ALICUOTA INSCRIPTO", "IVA 21%")]
-        for tag, nombre in tags:
-            match = re.search(f"{tag}.*?([\d\.,]+)", texto_total, re.S)
-            if match: impuestos.append({"Concepto": nombre, "Importe": limpiar_monto(match.group(1))})
+        match_fin = re.search(r"SALDO AL \d{2}/\d{2}/\d{2,4}\s+([\d\.,\-]+)", full_text) [cite: 79, 172]
+        if match_fin: saldo_final = normalize_money(match_fin.group(1))
 
-    return pd.DataFrame(movimientos), saldo_inicial, saldo_final, impuestos
+    # Post-procesar clasificaciones
+    for r in rows:
+        r["clasificacion"] = clasificar(r["descripcion"])
 
-# --- UI ---
-file = st.file_uploader("Subí el resumen", type="pdf")
+    return pd.DataFrame(rows), saldo_anterior, saldo_final, full_text
 
-if file:
-    df, s_ini, s_fin, imp_oficial = procesar_banco(file.read())
+# --- UI APP ---
+uploaded = st.file_uploader("Subí el PDF de Credicoop", type="pdf")
+
+if uploaded:
+    df, s_ant, s_fin, raw_text = parse_credicoop_estricto(uploaded.read())
     
-    # Cálculos
-    t_deb = df["Débito"].sum()
-    t_cre = df["Crédito"].sum()
-    calc = s_ini + t_cre - t_deb
-    
-    # Métricas
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saldo Anterior", f"$ {s_ini:,.2f}")
-    c2.metric("Créditos (+)", f"$ {t_cre:,.2f}")
-    c3.metric("Débitos (-)", f"$ {t_deb:,.2f}")
-    c4.metric("Diferencia", f"$ {calc - s_fin:,.2f}")
+    if not df.empty:
+        # Conciliación
+        t_deb = df["debito"].sum()
+        t_cre = df["credito"].sum()
+        s_calc = s_ant + t_cre - t_deb [cite: 158, 192]
+        diff = s_calc - s_fin
 
-    # Tabs
-    t1, t2, t3 = st.tabs(["Movimientos", "Gastos/Impuestos", "Préstamos"])
-    with t1:
-        st.dataframe(df, use_container_width=True)
-    with t2:
-        if imp_oficial: st.table(pd.DataFrame(imp_oficial))
-        else: st.info("No se detectó el cuadro resumen al final.")
-    with t3:
-        st.dataframe(df[df["Descripción"].str.contains("PREST|CUOTA|AMORT", case=False)])
+        # Métricas principales
+        st.subheader("📊 Conciliación")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Saldo Anterior", fmt_ar(s_ant)) [cite: 17, 158]
+        c2.metric("Créditos (+)", fmt_ar(t_cre))
+        c3.metric("Débitos (-)", fmt_ar(t_deb))
+        c4.metric("Diferencia", fmt_ar(diff), delta_color="inverse")
 
-    # Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Conciliacion')
-    st.download_button("Descargar Excel", output.getvalue(), "resumen.xlsx")
+        if abs(diff) < 1.0:
+            st.success(f"✅ Conciliado. Saldo final calculado: {fmt_ar(s_calc)}")
+        else:
+            st.error(f"❌ Error de conciliación. Diferencia: {fmt_ar(diff)}")
+
+        # Grillas
+        tab1, tab2, tab3 = st.tabs(["📋 Movimientos", "💰 Gastos e IVA", "🏦 Préstamos"])
+        
+        with tab1:
+            st.dataframe(df[["fecha", "descripcion", "debito", "credito"]], use_container_width=True)
+
+        with tab2:
+            st.write("### Resumen de Gastos (Basado en Movimientos)")
+            gastos_res = df.groupby("clasificacion")[["debito"]].sum().reset_index()
+            st.table(gastos_res[gastos_res["debito"] > 0])
+            
+            st.write("### Cuadro Oficial del Banco (Pie de página)")
+            # Extraer del texto bruto el resumen oficial [cite: 84, 187]
+            oficial = []
+            for tag in ["LEY 25413", "RG 2408", "IVA ALICUOTA INSCRIPTO"]:
+                m = re.search(f"{tag}.*?([\d\.,]+)", raw_text, re.S)
+                if m: oficial.append({"Concepto": tag, "Monto": m.group(1)})
+            if oficial: st.table(pd.DataFrame(oficial))
+
+        with tab3:
+            st.dataframe(df[df["clasificacion"] == "Préstamos"])
+
+        # Descarga Excel
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Conciliacion')
+        st.download_button("📥 Descargar Excel", output.getvalue(), "resumen_bancario.xlsx")

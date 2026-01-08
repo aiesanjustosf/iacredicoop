@@ -3,252 +3,264 @@ import pdfplumber
 import pandas as pd
 import re
 from io import BytesIO
-import operator
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Conciliador Automático Credicoop", layout="wide")
+# --- CONFIGURACIÓN VISUAL Y DE PÁGINA ---
+st.set_page_config(page_title="Conciliador Credicoop", layout="wide")
 
-# --- FUNCIONES DE LIMPIEZA ---
+# CSS para recuperar la estética de tarjetas limpias
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- FUNCIONES DE FORMATO ---
 
 def limpiar_numero_ar(valor):
-    """Convierte string formato '1.000,00' a float de forma robusta."""
-    if not valor:
-        return 0.0
-    
-    # Si ya es número, devolverlo
-    if isinstance(valor, (int, float)):
-        return float(valor)
+    """Convierte '1.000,00' a float de forma segura."""
+    if not valor: return 0.0
+    if isinstance(valor, (int, float)): return float(valor)
     
     val_str = str(valor).strip()
-    
-    # Detectar negativos (formato "1.000,00-" o "(1.000,00)")
     es_negativo = False
+    
+    # Detectar negativos (formato 1.000,00- o (1.000,00))
     if val_str.endswith("-") or (val_str.startswith("(") and val_str.endswith(")")):
         es_negativo = True
     
-    # Limpiar caracteres no numéricos excepto , y .
     val_str = re.sub(r'[^\d,.]', '', val_str)
-    
-    if not val_str:
-        return 0.0
+    if not val_str: return 0.0
         
     try:
-        # Formato AR: 1.000,00 -> 1000.00
         val_str = val_str.replace(".", "").replace(",", ".")
-        numero = float(val_str)
-        return -numero if es_negativo else numero
-    except ValueError:
+        num = float(val_str)
+        return -num if es_negativo else num
+    except:
         return 0.0
 
 def formatear_moneda_ar(valor):
-    if pd.isna(valor) or valor == "":
-        return ""
-    # Formato visual AR
+    """Visualización 1.000,00"""
+    if pd.isna(valor) or valor == "": return ""
     return "{:,.2f}".format(valor).replace(",", "X").replace(".", ",").replace("X", ".")
 
-# --- LÓGICA DE EXTRACCIÓN INTELIGENTE (SIN SLIDERS) ---
+# --- LÓGICA INTELIGENTE ---
 
-def es_fecha(texto):
-    # Detecta DD/MM/YY o DD/MM/AAAA
-    return bool(re.match(r'^\d{2}/\d{2}/\d{2,4}$', texto))
+def detectar_columnas_auto(pdf_page):
+    """Busca las palabras clave en la cabecera para definir las columnas x automaticamente"""
+    words = pdf_page.extract_words()
+    
+    # Valores por defecto (Fallback) si no encuentra las palabras
+    x_desc = 320
+    x_debito = 480
+    x_credito = 580
+    
+    found_deb = False
+    found_cred = False
+    found_saldo = False
 
-def es_numero_moneda(texto):
-    # Detecta si parece un monto (tiene dígitos y coma o punto)
-    return bool(re.search(r'\d+[.,]\d+', texto))
+    # Buscamos las cabeceras
+    for w in words:
+        text = w['text'].lower()
+        if "descripción" in text or "concepto" in text:
+            # El fin de la descripción suele ser un poco antes de donde empieza el débito
+            x_desc = w['x1'] + 50 
+        if "débito" in text or "debito" in text:
+            x_debito = w['x0'] - 10 # Un poco a la izquierda de la palabra
+            found_deb = True
+        if "crédito" in text or "credito" in text:
+            x_credito = w['x0'] - 10
+            found_cred = True
+            
+    # Lógica de corrección: Si encontró Débito, usalo para ajustar Descripción
+    if found_deb:
+        x_desc = x_debito - 10
 
-def procesar_pdf_inteligente(pdf_file):
-    movimientos = []
+    return [x_desc, x_debito, x_credito]
+
+def procesar_pdf(pdf_file, use_auto, manual_coords=None):
+    data = []
     saldo_anterior = 0.0
+    columns = ["Fecha", "Descripcion", "Debito", "Credito", "Saldo_PDF"] # Estructura base
     
-    # Puntos de corte APROXIMADOS para Credicoop (Hoja A4 estándar)
-    # X0 es la coordenada izquierda de la palabra.
-    # Zona Débito: aprox 380 a 510 puntos
-    # Zona Crédito: aprox 510 a 620 puntos
-    # Zona Saldo: > 620 puntos
-    LIMIT_DEBITO_START = 350
-    LIMIT_CREDITO_START = 510
-    LIMIT_SALDO_START = 620
-    
-    with pdfplumber.open(pdf_file) as pdf:
-        # 1. Buscar Saldo Anterior en pág 1
-        if len(pdf.pages) > 0:
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            if len(pdf.pages) == 0: return pd.DataFrame(columns=columns), 0.0
+            
+            # 1. Obtener Saldo Anterior (Regex en pág 1)
             text_p1 = pdf.pages[0].extract_text() or ""
-            match = re.search(r"Saldo anterior[:\s]+([\d.,\-]+)", text_p1, re.IGNORECASE)
-            if match:
-                saldo_anterior = limpiar_numero_ar(match.group(1))
+            match_saldo = re.search(r"Saldo anterior[:\s]+([\d.,\-]+)", text_p1, re.IGNORECASE)
+            if match_saldo:
+                saldo_anterior = limpiar_numero_ar(match_saldo.group(1))
 
-        # 2. Procesar páginas geométricamente
-        for page in pdf.pages:
-            # Extraemos TODAS las palabras con sus coordenadas (x, y)
-            words = page.extract_words(keep_blank_chars=True, x_tolerance=3, y_tolerance=3)
+            # 2. Definir coordenadas de corte
+            if use_auto:
+                # Detectar en la primera página
+                coords = detectar_columnas_auto(pdf.pages[0])
+            else:
+                coords = manual_coords
+
+            # Líneas verticales: [Inicio, FinDesc/InicioDeb, FinDeb/InicioCred, FinCred/InicioSaldo]
+            # Ajustamos para extract_table: [0, x_desc, x_debito, x_credito, page_width]
             
-            # Agrupar palabras por renglón (usando su posición 'top' con pequeña tolerancia)
-            # Esto reconstruye las líneas visuales
-            rows = {}
-            for w in words:
-                # Redondeamos 'top' para agrupar palabras en la misma línea visual
-                row_key = round(w['top'] / 5) * 5 
-                if row_key not in rows:
-                    rows[row_key] = []
-                rows[row_key].append(w)
-            
-            # Ordenar renglones de arriba a abajo
-            sorted_row_keys = sorted(rows.keys())
-            
-            for key in sorted_row_keys:
-                line_words = rows[key]
-                # Ordenar palabras de izquierda a derecha en el renglón
-                line_words.sort(key=operator.itemgetter('x0'))
+            for page in pdf.pages:
+                vertical_lines = [0] + coords + [page.width]
                 
-                # VALIDACIÓN 1: ¿Empieza con fecha?
-                first_word = line_words[0]['text']
-                if not es_fecha(first_word):
-                    continue # No es movimiento, saltar
+                table_settings = {
+                    "vertical_strategy": "explicit",
+                    "explicit_vertical_lines": vertical_lines,
+                    "horizontal_strategy": "text",
+                    "intersection_y_tolerance": 5, 
+                }
                 
-                fecha = first_word
+                table = page.extract_table(table_settings)
                 
-                # Variables para esta fila
-                descripcion_parts = []
-                debito = 0.0
-                credito = 0.0
-                saldo_linea = 0.0
-                
-                # Iterar el resto de palabras para clasificar
-                # Empezamos desde la segunda palabra
-                for w in line_words[1:]:
-                    text = w['text']
-                    x_pos = w['x0'] # Posición horizontal inicial
-                    
-                    if es_numero_moneda(text):
-                        valor = limpiar_numero_ar(text)
+                if table:
+                    for row in table:
+                        # Limpieza y validación
+                        row = [c.strip() if c else "" for c in row]
                         
-                        # CLASIFICACIÓN GEOMÉTRICA AUTOMÁTICA
-                        if x_pos > LIMIT_SALDO_START:
-                            saldo_linea = valor
-                        elif x_pos > LIMIT_CREDITO_START:
-                            credito = valor
-                        elif x_pos > LIMIT_DEBITO_START:
-                            debito = valor
-                        else:
-                            # Si es un número pero está muy a la izquierda, es parte de la descripción
-                            # (Ej: "Cuota 12 de 12")
-                            descripcion_parts.append(text)
-                    else:
-                        # Si no parece número, es descripción
-                        descripcion_parts.append(text)
-                
-                descripcion = " ".join(descripcion_parts)
-                
-                # Guardar movimiento
-                movimientos.append({
-                    "Fecha": fecha,
-                    "Descripcion": descripcion,
-                    "Debito": debito,
-                    "Credito": credito,
-                    "Saldo_PDF": saldo_linea
-                })
+                        # Debe tener fecha válida (DD/MM/YY) en la primera columna
+                        if len(row) >= 5 and re.match(r'\d{2}/\d{2}/\d{2}', row[0]):
+                            try:
+                                data.append({
+                                    "Fecha": row[0],
+                                    "Descripcion": row[1],
+                                    "Debito": limpiar_numero_ar(row[2]),
+                                    "Credito": limpiar_numero_ar(row[3]),
+                                    "Saldo_PDF": limpiar_numero_ar(row[4])
+                                })
+                            except:
+                                continue
 
-    return pd.DataFrame(movimientos), saldo_anterior
+    except Exception as e:
+        st.error(f"Error leyendo el PDF: {e}")
+        return pd.DataFrame(columns=columns), 0.0
 
-# --- LÓGICA DE CONTROL ---
-
-def verificar_conciliacion(df, saldo_inicial):
-    if df.empty:
-        return df, 0, 0, 0
+    if not data:
+        return pd.DataFrame(columns=columns), saldo_anterior
         
+    return pd.DataFrame(data), saldo_anterior
+
+def calcular_conciliacion(df, saldo_ini):
+    if df.empty: return df, 0, 0, 0
+    
     df['Saldo_Calculado'] = 0.0
     df['Estado'] = 'OK'
     df['Diferencia'] = 0.0
     
-    saldo_acum = saldo_inicial
-    total_cred = df['Credito'].sum()
-    total_deb = df['Debito'].sum()
+    acumulado = saldo_ini
+    t_cred = df['Credito'].sum()
+    t_deb = df['Debito'].sum()
     
-    for idx, row in df.iterrows():
-        saldo_acum += (row['Credito'] - row['Debito'])
-        df.at[idx, 'Saldo_Calculado'] = saldo_acum
+    for i, row in df.iterrows():
+        acumulado += (row['Credito'] - row['Debito'])
+        df.at[i, 'Saldo_Calculado'] = acumulado
         
-        # Validar Checkpoint
+        # Checkpoint con columna Saldo del PDF
         saldo_pdf = row['Saldo_PDF']
         if saldo_pdf != 0:
-            diff = round(saldo_acum - saldo_pdf, 2)
+            diff = round(acumulado - saldo_pdf, 2)
             if abs(diff) > 1.00:
-                df.at[idx, 'Estado'] = 'ERROR'
-                df.at[idx, 'Diferencia'] = diff
+                df.at[i, 'Estado'] = 'ERROR'
+                df.at[i, 'Diferencia'] = diff
             else:
-                # Sincronizar para evitar arrastre de decimales
-                saldo_acum = saldo_pdf
+                acumulado = saldo_pdf # Sincronizar
                 
-    return df, total_cred, total_deb, saldo_acum
+    return df, t_cred, t_deb, acumulado
 
-# --- FRONTEND (UI) ---
+# --- INTERFAZ DE USUARIO ---
 
-st.title("⚡ Conciliador Credicoop Automático")
-st.markdown("Sin configuraciones manuales. Subí el PDF y el sistema detectará las columnas automáticamente.")
+st.title("🏦 Conciliador Automático Credicoop")
 
-uploaded_file = st.file_uploader("Arrastrá tu extracto PDF aquí", type="pdf")
+# Panel lateral o Expander para "Ajustes Finos" (oculto por defecto)
+with st.expander("⚙️ Configuración Avanzada (Si no lee bien las columnas)", expanded=False):
+    col_opt, col_sliders = st.columns([1, 3])
+    with col_opt:
+        modo_auto = st.checkbox("Detección Automática", value=True, help="Intenta buscar los encabezados Débito/Crédito solo")
+    
+    with col_sliders:
+        st.caption("Ajustar líneas verticales manualmente:")
+        x_desc = st.slider("Fin Descripción / Inicio Débito", 200, 500, 320)
+        x_deb = st.slider("Fin Débito / Inicio Crédito", 400, 600, 480)
+        x_cred = st.slider("Fin Crédito / Inicio Saldo", 500, 700, 580)
+
+# Carga de Archivo
+uploaded_file = st.file_uploader("Arrastrá y soltá el PDF aquí", type="pdf")
 
 if uploaded_file:
-    try:
-        # 1. Procesar (Magia Automática)
-        with st.spinner('Analizando documento con IA...'):
-            df_raw, saldo_ini_auto = procesar_pdf_inteligente(uploaded_file)
+    # Procesar
+    manual_coords = [x_desc, x_deb, x_cred]
+    df_raw, saldo_detectado = procesar_pdf(uploaded_file, modo_auto, manual_coords)
+    
+    # Input Saldo Anterior (Editable)
+    col_saldo, _ = st.columns([1, 3])
+    with col_saldo:
+        saldo_inicial = st.number_input("Saldo Anterior", value=saldo_detectado, step=1000.0)
+
+    # Validar si hay datos
+    if df_raw.empty:
+        st.warning("⚠️ No se pudieron leer movimientos.")
+        st.info("Intento de solución: Abre la 'Configuración Avanzada' arriba, desactiva 'Detección Automática' y mueve los sliders hasta que coincidan con las columnas de tu PDF.")
+    else:
+        # Calcular
+        df_final, tot_cred, tot_deb, saldo_final = calcular_conciliacion(df_raw, saldo_inicial)
         
-        # 2. Input Saldo (Editable pero pre-llenado)
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            saldo_inicial = st.number_input("Saldo Anterior", value=saldo_ini_auto, step=1000.0)
+        st.divider()
+
+        # TARJETAS DE MÉTRICAS (Diseño visual)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Saldo Anterior", formatear_moneda_ar(saldo_inicial))
+        c2.metric("Total Créditos", formatear_moneda_ar(tot_cred), delta="Ingresos")
+        c3.metric("Total Débitos", formatear_moneda_ar(tot_deb), delta="-Egresos", delta_color="inverse")
         
-        if df_raw.empty:
-            st.error("❌ No se encontraron movimientos. Asegurate de que sea un PDF de Credicoop original (no escaneado como imagen).")
+        # Color del Saldo Final según integridad
+        errores = df_final[df_final['Estado'] == 'ERROR']
+        if not errores.empty:
+            c4.metric("Saldo Calculado", formatear_moneda_ar(saldo_final), "Con Diferencias", delta_color="inverse")
+            
+            # ALERTA VISUAL
+            st.error(f"❌ ERROR DE CONCILIACIÓN: Hay {len(errores)} movimientos donde el saldo no coincide.")
+            st.write("Diferencias detectadas (Saldo Calculado vs Saldo Real del PDF):")
+            
+            view_err = errores[['Fecha', 'Descripcion', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']].copy()
+            for c in view_err.columns[2:]: view_err[c] = view_err[c].apply(formatear_moneda_ar)
+            st.dataframe(view_err, use_container_width=True)
+            
         else:
-            # 3. Calcular Conciliación
-            df_fin, t_cred, t_deb, saldo_fin = verificar_conciliacion(df_raw, saldo_inicial)
-            
-            # 4. Métricas
-            with col2:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total Créditos", formatear_moneda_ar(t_cred))
-                c2.metric("Total Débitos", formatear_moneda_ar(t_deb))
-                c3.metric("Saldo Final Calculado", formatear_moneda_ar(saldo_fin))
+            c4.metric("Saldo Calculado", formatear_moneda_ar(saldo_final), "Conciliado OK")
+            st.success("✅ Conciliación Perfecta. Los saldos parciales coinciden con el banco.")
 
-            st.divider()
-
-            # 5. Verificación de Errores
-            errores = df_fin[df_fin['Estado'] == 'ERROR']
+        # TABLA PRINCIPAL
+        st.subheader("Detalle de Movimientos")
+        
+        # Formateo para visualización
+        df_display = df_final.copy()
+        cols_fmt = ['Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']
+        for c in cols_fmt:
+            df_display[c] = df_display[c].apply(formatear_moneda_ar)
             
-            if not errores.empty:
-                st.error(f"⚠️ Atención: Hay {len(errores)} diferencias detectadas.")
-                st.write("El sistema detectó que el saldo calculado no coincide con el impreso en estas líneas:")
-                
-                # Tabla de errores formateada
-                err_view = errores[['Fecha', 'Descripcion', 'Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']].copy()
-                for c in ['Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']:
-                    err_view[c] = err_view[c].apply(formatear_moneda_ar)
-                st.dataframe(err_view, use_container_width=True)
-            else:
-                st.success("✅ Conciliación Perfecta. Todos los números cierran.")
-
-            # 6. Tabla y Exportación
-            with st.expander("Ver Detalle Completo", expanded=True):
-                # Formateo para vista
-                df_view = df_fin.copy()
-                for c in ['Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']:
-                    df_view[c] = df_view[c].apply(formatear_moneda_ar)
-                st.dataframe(df_view, use_container_width=True, height=500)
+        st.dataframe(df_display, use_container_width=True, height=500)
+        
+        # EXPORTAR
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df_final.to_excel(writer, index=False, sheet_name='Conciliacion')
             
-            # Botón Excel
-            buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_fin.to_excel(writer, index=False, sheet_name='Conciliacion')
-            
-            st.download_button(
-                "📥 Descargar Excel", 
-                data=buffer.getvalue(), 
-                file_name="conciliacion_automatica.xlsx", 
-                mime="application/vnd.ms-excel",
-                type="primary"
-            )
-
-    except Exception as e:
-        st.error(f"Ocurrió un error inesperado: {e}")
+        st.download_button(
+            "📥 Descargar Excel (.xlsx)", 
+            data=buffer.getvalue(), 
+            file_name="conciliacion_credicoop.xlsx", 
+            mime="application/vnd.ms-excel",
+            type="primary"
+        )
+else:
+    # Mensaje de bienvenida limpio
+    st.info("👆 Subí el archivo PDF para comenzar el análisis automático.")

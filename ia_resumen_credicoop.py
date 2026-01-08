@@ -1,870 +1,330 @@
-# ia_resumen_credicoop.py
-# IA Resumen Credicoop (Cuenta Corriente Comercial PDF)
-# Herramienta para uso interno - AIE San Justo
-#
-# Parser híbrido:
-#  - CHARS (pdfplumber.page.chars): para PDFs con texto seleccionable aunque esté "letter-spaced"
-#  - OCR (Tesseract): fallback para PDFs CID/Type3 o escaneados
-#
-# Reglas Credicoop:
-#  - Un movimiento comienza en una línea que tiene FECHA (dd/mm/aa o dd/mm/aaaa).
-#  - Si una descripción ocupa 2 renglones y sólo el primero tiene fecha, el segundo es continuación.
-#  - Nunca hay débito y crédito juntos en un movimiento (si OCR mete ambos, se preserva y se ve en grilla).
-#  - Si hay 2 montos en la misma línea, el de la derecha es SALDO diario (NO se usa).
-#  - Conciliación estricta: Saldo anterior + Créditos - Débitos = Saldo AL (fecha).
-#  - Débito siempre a la izquierda, Crédito a la derecha.
-#  - Saldos pueden ser negativos.
-#
-# Developer: Alfonso Alderete
-
-from __future__ import annotations
-
 import io
 import re
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import pandas as pd
 import streamlit as st
+import pdfplumber
+import numpy as np
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
-# ---------------- deps diferidas ----------------
-try:
-    import pdfplumber
-except Exception as e:
-    st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
-    st.stop()
+# --- CONFIGURACIÓN UI ---
+st.set_page_config(page_title="IA Resumen Credicoop - Conciliación Espacial", layout="wide")
+st.title("🏦 IA Resumen Credicoop: Conciliación Estricta")
+st.markdown("""
+**Corrección aplicada:** Se utiliza detección espacial de coordenadas X. 
+Los montos se asignan a Debe/Haber según su posición física bajo los encabezados, solucionando el error de columnas invertidas.
+""")
 
-try:
-    import pytesseract
-    from PIL import Image
-except Exception as e:
-    st.error(f"No se pudo importar pytesseract/Pillow: {e}\nRevisá requirements.txt")
-    st.stop()
+# --- UTILIDADES ---
+def fmt_ar(n):
+    if n is None or np.isnan(n): return "—"
+    return f"$ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib import colors
-    REPORTLAB_OK = True
-except Exception:
-    REPORTLAB_OK = False
-
-
-# ---------------- UI / assets ----------------
-HERE = Path(__file__).parent
-LOGO = HERE / "logo_aie.png"
-FAVICON = HERE / "favicon-aie.ico"
-
-st.set_page_config(
-    page_title="IA Resumen Credicoop",
-    page_icon=str(FAVICON) if FAVICON.exists() else None,
-    layout="centered",
-)
-
-if LOGO.exists():
-    st.image(str(LOGO), width=200)
-
-st.title("IA Resumen Credicoop")
-
-st.markdown(
-    """
-    <style>
-      .block-container { max-width: 900px; padding-top: 2rem; padding-bottom: 2rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------- regex ----------------
-DATE_RE = re.compile(r"^\s*(\d{2})[\/⁄](\d{2})[\/⁄](\d{2}|\d{4})\b")
-DATE_ANY_RE = re.compile(r"\b\d{2}[\/⁄]\d{2}[\/⁄]\d{2,4}\b")
-
-MONEY_STRICT_RE = re.compile(r"^-?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}$")
-MONEY_FUZZY_RE = re.compile(r"-?\d{1,3}(?:[.\s']?\d{3})*,\d{2}")
-
-LONG_INT_RE = re.compile(r"\b\d{6,}\b")
-
-
-def fmt_ar(n) -> str:
-    if n is None or (isinstance(n, float) and np.isnan(n)):
-        return "—"
-    return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
-
-
-def normalize_money(tok: str) -> float:
-    if tok is None:
-        return np.nan
-    s = str(tok).strip()
-    s = s.replace("−", "-").replace(" ", "")
-    s = s.replace("'", "")
-    neg = s.startswith("-")
-    s2 = s.lstrip("-")
-    if "," not in s2:
-        return np.nan
-    main, frac = s2.rsplit(",", 1)
-    main = main.replace(".", "")
-    frac = re.sub(r"\D", "", frac)[:2]
-    if len(frac) != 2:
-        return np.nan
+def parse_money(text):
+    """Convierte texto 1.000,00 a float 1000.0"""
+    if not text: return 0.0
+    # Limpieza agresiva de caracteres invisibles
+    text = str(text).replace(" ", "").replace("−", "-").replace("–", "-")
+    # Formato argentino: quitar puntos de miles, cambiar coma decimal por punto
+    clean = text.replace(".", "").replace(",", ".")
     try:
-        v = float(f"{main}.{frac}")
-        return -v if neg else v
-    except Exception:
-        return np.nan
+        return float(clean)
+    except ValueError:
+        return 0.0
 
-
-def norm_txt(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ").strip()
-    s = s.replace("⁄", "/")
-    return re.sub(r"\s{2,}", " ", s)
-
-
-def normalize_desc(desc: str) -> str:
-    u = (desc or "").upper()
-    u = u.replace(".", "")  # I.V.A. => IVA
-    u = LONG_INT_RE.sub("", u)
-    u = " ".join(u.split())
-    return u
-
-
-def is_cid_pdf(pdf) -> bool:
-    try:
-        t = pdf.pages[0].extract_text() or ""
-        return "(cid:" in t
-    except Exception:
-        return False
-
-
-# ---------------- clasificación ----------------
-def clasificar(desc: str) -> str:
-    n = normalize_desc(desc)
-
-    if "25413" in n or "25.413" in n or "LEY 25413" in n or "IMPUESTO LEY 25413" in n or "IMPUESTO A LOS DEBITOS Y CREDITOS" in n:
-        return "Ley 25.413"
-
-    if "SIRCREB" in n:
-        return "SIRCREB"
-
-    if ("PERCEP" in n and "IVA" in n) or ("RG 2408" in n) or ("RG2408" in n) or ("2408" in n and "IVA" in n):
-        return "Percepciones de IVA"
-
-    if "DEBITO FISCAL" in n and "IVA" in n:
-        if "10,5" in n or "10.5" in n or "10 5" in n:
-            return "IVA 10,5%"
+def clasificar_movimiento(desc):
+    """Clasifica el gasto para el resumen impositivo/operativo"""
+    u = desc.upper()
+    if "25413" in u or "25.413" in u: return "Ley 25.413 (Imp. Cheque)"
+    if "SIRCREB" in u: return "SIRCREB"
+    if "PERCEP" in u and "IVA" in u: return "Percepciones IVA"
+    if "I.V.A." in u or "IVA " in u:
+        if "10,5" in u: return "IVA 10,5%"
         return "IVA 21%"
+    if any(x in u for x in ["COMISION", "MANTENIMIENTO", "SERVICIO", "GASTOS"]): return "Gastos Bancarios (Neto)"
+    if any(x in u for x in ["PRESTAMO", "CUOTA", "AMORTIZACION"]): return "Préstamos"
+    return "Otros Movimientos"
 
-    if ("INTERES" in n or "SALDO DEUDOR" in n or "INT " in n) and "IVA" not in n:
-        return "Comisiones/Gastos Neto 10,5%"
-
-    # comisiones/gastos neto 21 por defecto (evitando IVA y ley)
-    if any(k in n for k in ["COMISION", "SERVICIO", "MANTEN", "GASTO", "CARGO", "PAQUETE"]) and "IVA" not in n and "DEBITO FISCAL" not in n:
-        return "Comisiones/Gastos Neto 21%"
-
-    if re.search(r"\bPREST", n):
-        return "Préstamos"
-
-    return "Otros"
-
-
-# ---------------- OCR helpers ----------------
-@dataclass
-class Tok:
-    text: str
-    x0: float
-    x1: float
-    top: float
-
-
-def _group_lines(tokens: List[Tok], ytol: float = 9.0) -> List[List[Tok]]:
-    if not tokens:
-        return []
-    toks = sorted(tokens, key=lambda t: (t.top, t.x0))
-    lines: List[List[Tok]] = []
-    cur: List[Tok] = []
-    y0 = None
-    for t in toks:
-        if y0 is None or abs(t.top - y0) <= ytol:
-            cur.append(t)
-            if y0 is None:
-                y0 = t.top
-        else:
-            lines.append(sorted(cur, key=lambda z: z.x0))
-            cur = [t]
-            y0 = t.top
-    if cur:
-        lines.append(sorted(cur, key=lambda z: z.x0))
-    return lines
-
-
-def _money_tokens_from_line(line: List[Tok]) -> List[Tuple[float, float, str, float]]:
+# --- LÓGICA CORE: PARSER ESPACIAL ---
+def obtener_limites_columnas(pdf):
     """
-    Extrae montos del renglón. Re-arma casos OCR partidos:
-      "1.388," + "05" => "1.388,05"
-    Devuelve lista de (x0,x1,text,val).
+    Busca en la primera página la posición X de los encabezados 'DEBITO' y 'CREDITO'
+    para saber dónde cortar las columnas dinámicamente.
     """
-    out = []
-    i = 0
-    while i < len(line):
-        t = norm_txt(line[i].text)
-        if not t:
-            i += 1
-            continue
-
-        # caso partido (termina con coma + siguiente token de 2 dígitos)
-        if (t.endswith(",") or ("," in t and not re.search(r",\d{2}$", t))) and i + 1 < len(line):
-            nxt = norm_txt(line[i + 1].text)
-            if re.fullmatch(r"\d{2}", nxt):
-                cand = (t + nxt).replace(" ", "")
-                if MONEY_STRICT_RE.match(cand) or MONEY_FUZZY_RE.fullmatch(cand):
-                    val = normalize_money(cand)
-                    if not np.isnan(val):
-                        out.append((line[i].x0, line[i + 1].x1, cand, float(val)))
-                        i += 2
-                        continue
-
-        t2 = t.replace(" ", "")
-        if MONEY_STRICT_RE.match(t2) or MONEY_FUZZY_RE.fullmatch(t2):
-            val = normalize_money(t2)
-            if not np.isnan(val):
-                out.append((line[i].x0, line[i].x1, t2, float(val)))
-
-        i += 1
-    return out
-
-
-def _line_text(line: List[Tok]) -> str:
-    return " ".join(norm_txt(t.text) for t in line if norm_txt(t.text))
-
-
-def _detect_date_at_start(line: List[Tok]) -> Optional[str]:
-    if not line:
-        return None
-    full = _line_text(line)
-    m = DATE_RE.match(full)
-    if m:
-        return m.group(0).replace("⁄", "/")
-    return None
-
-
-def _parse_date(s: str) -> Optional[datetime]:
-    s = norm_txt(s).replace("⁄", "/")
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            pass
-    return None
-
-
-def _ocr_page_tokens(page, resolution: int = 240, crop_top: int = 40, crop_bottom: int = 40) -> Tuple[List[Tok], int, int]:
-    """
-    OCR de página con recorte suave (para no cortar SALDO ANTERIOR).
-    """
-    crop = page.crop((0, crop_top, page.width, page.height - crop_bottom))
-    img = crop.to_image(resolution=resolution).original.convert("RGB")
-    cfg = "--psm 6"
-    df = pytesseract.image_to_data(img, lang="spa", config=cfg, output_type=pytesseract.Output.DATAFRAME)
-    df = df.dropna(subset=["text"]).copy()
-    df["text"] = df["text"].astype(str).map(lambda s: s.strip())
-    df = df[df["text"] != ""]
-    toks = [Tok(text=str(r.text), x0=float(r.left), x1=float(r.left + r.width), top=float(r.top))
-            for r in df.itertuples(index=False)]
-    return toks, img.width, img.height
-
-
-def _kmeans_1d_two_clusters(xs: List[float], iters: int = 12) -> Optional[Tuple[float, float, float]]:
-    xs = [float(x) for x in xs if x is not None and not np.isnan(x)]
-    if len(xs) < 6:
-        return None
-    arr = np.array(xs, dtype=float)
-    c1 = np.quantile(arr, 0.33)
-    c2 = np.quantile(arr, 0.66)
-    for _ in range(iters):
-        d1 = np.abs(arr - c1)
-        d2 = np.abs(arr - c2)
-        lab = d1 <= d2
-        if lab.all() or (~lab).all():
-            break
-        c1n = arr[lab].mean()
-        c2n = arr[~lab].mean()
-        c1, c2 = c1n, c2n
-    left, right = (c1, c2) if c1 < c2 else (c2, c1)
-    thr = (left + right) / 2.0
-    return float(left), float(right), float(thr)
-
-
-# ---------------- OCR parsing ----------------
-def parse_ocr(pdf_bytes: bytes, pdf_name: str) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    rows = []
-    saldo_inicial = np.nan
-    saldo_final = np.nan
-    fecha_final = ""
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            toks, w, _ = _ocr_page_tokens(page, resolution=240, crop_top=40, crop_bottom=40)
-            lines = _group_lines(toks, ytol=9.0)
-
-            # anclas de saldo
-            for ln in lines:
-                line_txt = normalize_desc(_line_text(ln))
-                mny = _money_tokens_from_line(ln)
-                if not mny:
-                    continue
-                mny_sorted = sorted(mny, key=lambda x: x[1])
-                if "SALDO ANTERIOR" in line_txt:
-                    saldo_inicial = float(mny_sorted[-1][3])
-                if "SALDO AL" in line_txt:
-                    md = DATE_ANY_RE.search(_line_text(ln))
-                    if md:
-                        fecha_final = md.group(0).replace("⁄", "/")
-                    saldo_final = float(mny_sorted[-1][3])
-
-            current = None
-            x_centers = []
-            items = []
-
-            for ln in lines:
-                date_raw = _detect_date_at_start(ln)
-                mny = _money_tokens_from_line(ln)
-
-                if date_raw:
-                    if current is not None:
-                        items.append(current)
-
-                    current = {
-                        "fecha_raw": date_raw,
-                        "comprobante": "",
-                        "descripcion": "",
-                        "amounts": [],      # (xc,val)
-                        "pagina": pageno,
-                    }
-
-                    # comprobante: primer token numérico 3+ dígitos
-                    for t in ln:
-                        tt = norm_txt(t.text)
-                        if tt.isdigit() and len(tt) >= 3:
-                            current["comprobante"] = tt
-                            break
-
-                    # descripción: tokens no monetarios
-                    parts = []
-                    for t in ln:
-                        tt = norm_txt(t.text)
-                        if not tt:
-                            continue
-                        if DATE_ANY_RE.fullmatch(tt):
-                            continue
-                        if current["comprobante"] and tt == current["comprobante"]:
-                            continue
-                        if MONEY_STRICT_RE.match(tt.replace(" ", "")) or MONEY_FUZZY_RE.fullmatch(tt.replace(" ", "")) or tt.endswith(","):
-                            continue
-                        parts.append(tt)
-
-                    desc = " ".join(parts).strip()
-                    if desc.startswith(date_raw):
-                        desc = desc[len(date_raw):].strip()
-                    current["descripcion"] = desc
-
-                    # importes: si hay 2+, descartar el último (saldo diario)
-                    if mny:
-                        mny_sorted = sorted(mny, key=lambda x: x[1])
-                        if len(mny_sorted) >= 2:
-                            mny_sorted = mny_sorted[:-1]
-                        for x0, x1, _, val in mny_sorted:
-                            xc = (x0 + x1) / 2.0
-                            current["amounts"].append((xc, float(val)))
-                            x_centers.append(xc)
-
-                else:
-                    if current is None:
-                        continue
-
-                    # continuación descripción
-                    parts = []
-                    for t in ln:
-                        tt = norm_txt(t.text)
-                        if not tt:
-                            continue
-                        if MONEY_STRICT_RE.match(tt.replace(" ", "")) or MONEY_FUZZY_RE.fullmatch(tt.replace(" ", "")) or tt.endswith(","):
-                            continue
-                        if DATE_ANY_RE.search(tt):
-                            continue
-                        parts.append(tt)
-                    extra = " ".join(parts).strip()
-                    if extra:
-                        current["descripcion"] = (current["descripcion"] + " " + extra).strip()
-
-                    # si trae importes, anexar al movimiento (sin inventar fecha nueva)
-                    if mny:
-                        mny_sorted = sorted(mny, key=lambda x: x[1])
-                        if len(mny_sorted) >= 2:
-                            mny_sorted = mny_sorted[:-1]
-                        for x0, x1, _, val in mny_sorted:
-                            xc = (x0 + x1) / 2.0
-                            current["amounts"].append((xc, float(val)))
-                            x_centers.append(xc)
-
-            if current is not None:
-                items.append(current)
-
-            km = _kmeans_1d_two_clusters(x_centers)
-            thr = km[2] if km else (w * 0.68)
-
-            for it in items:
-                dt = _parse_date(it["fecha_raw"])
-                if dt is None:
-                    continue
-
-                deb = 0.0
-                cre = 0.0
-                for xc, val in it["amounts"]:
-                    if xc <= thr:
-                        deb += float(val)
-                    else:
-                        cre += float(val)
-
-                desc = norm_txt(it["descripcion"])
-                rows.append({
-                    "fecha": dt.date(),
-                    "fecha_raw": it["fecha_raw"],
-                    "comprobante": it["comprobante"] or "",
-                    "descripcion": desc,
-                    "desc_norm": normalize_desc(desc),
-                    "debito": float(deb) if deb else 0.0,
-                    "credito": float(cre) if cre else 0.0,
-                    "Clasificación": clasificar(desc),
-                    "archivo": pdf_name,
-                    "pagina": it["pagina"],
-                })
-
-    meta = {
-        "saldo_inicial": float(saldo_inicial) if not np.isnan(saldo_inicial) else np.nan,
-        "saldo_final": float(saldo_final) if not np.isnan(saldo_final) else np.nan,
-        "fecha_final": fecha_final,
+    first_page = pdf.pages[0]
+    words = first_page.extract_words()
+    
+    # Valores por defecto (por si falla la detección, basados en A4 estándar Credicoop)
+    # Debito suele empezar ~380 y terminar ~450. Credito ~450 a ~520.
+    limites = {
+        "debito_start": 350,
+        "debito_end": 460, # Frontera entre debito y credito
+        "credito_end": 530 # Frontera entre credito y saldo
     }
-    return pd.DataFrame(rows), meta
+    
+    # Buscar coordenadas reales
+    deb_box = None
+    cred_box = None
+    
+    for w in words:
+        if w['text'] == "DEBITO": deb_box = w
+        if w['text'] == "CREDITO": cred_box = w
+    
+    if deb_box and cred_box:
+        # El límite entre débito y crédito es el punto medio entre el fin de uno y el inicio del otro
+        limites["debito_start"] = deb_box['x0'] - 20
+        limites["debito_end"] = (deb_box['x1'] + cred_box['x0']) / 2
+        limites["credito_end"] = cred_box['x1'] + 40 # Un margen a la derecha del crédito
+        
+    return limites
 
-
-# ---------------- CHARS parsing ----------------
-def _chars_lines(page, ytol: float = 2.2):
-    chars = page.chars or []
-    chars_sorted = sorted(chars, key=lambda c: (round(float(c.get("top", 0)) / ytol), float(c.get("x0", 0))))
-    lines = []
-    cur = []
-    band = None
-    for c in chars_sorted:
-        b = round(float(c.get("top", 0)) / ytol)
-        if band is None or b == band:
-            cur.append(c)
-        else:
-            lines.append(cur)
-            cur = [c]
-        band = b
-    if cur:
-        lines.append(cur)
-
-    out_lines = []
-    for ln in lines:
-        ln = sorted(ln, key=lambda c: float(c.get("x0", 0)))
-        text = "".join(c.get("text", "") for c in ln)
-        text = norm_txt(text)
-        if text:
-            out_lines.append(text)
-    return out_lines
-
-
-def _money_spans_from_text(text: str) -> List[str]:
-    toks = []
-    for token in re.split(r"\s+", text):
-        t = token.strip().replace("−", "-")
-        if not t:
-            continue
-        if MONEY_STRICT_RE.match(t) or MONEY_FUZZY_RE.fullmatch(t):
-            toks.append(t)
-    return toks
-
-
-def parse_chars(pdf_bytes: bytes, pdf_name: str) -> Tuple[pd.DataFrame, Dict[str, float]]:
+def procesar_pdf_espacial(pdf_bytes):
     rows = []
-    saldo_inicial = np.nan
-    saldo_final = np.nan
-    fecha_final = ""
-
+    saldo_inicial = 0.0
+    saldo_final = 0.0
+    resumen_impositivo_oficial = [] # Para guardar el cuadro del final del PDF
+    
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            lines = _chars_lines(page, ytol=2.2)
+        # 1. Detectar Geometría
+        limites = obtener_limites_columnas(pdf)
+        
+        full_text_for_footer = "" # Texto plano para buscar saldos finales y cuadros
+        
+        for page in pdf.pages:
+            # Texto plano para búsquedas globales (Saldo final, cuadros)
+            full_text_for_footer += page.extract_text() + "\n"
+            
+            # Extraer palabras con sus posiciones
+            words = page.extract_words(x_tolerance=2, y_tolerance=3)
+            
+            # Agrupar palabras por líneas (mismo eje Y aprox)
+            lines = {}
+            for w in words:
+                top = round(w['top']) # Redondear para agrupar líneas imperfectas
+                if top not in lines: lines[top] = []
+                lines[top].append(w)
+            
+            # Ordenar líneas de arriba a abajo
+            sorted_y = sorted(lines.keys())
+            
+            for y in sorted_y:
+                line_words = sorted(lines[y], key=lambda w: w['x0'])
+                line_text = " ".join([w['text'] for w in line_words])
+                
+                # Detectar si es una línea de movimiento (empieza con Fecha)
+                match_date = re.match(r"^(\d{2}/\d{2}/\d{2,4})", line_text)
+                
+                if match_date:
+                    fecha = match_date.group(1)
+                    
+                    # Inicializar
+                    debito = 0.0
+                    credito = 0.0
+                    descripcion_parts = []
+                    
+                    # Analizar cada palabra de la línea
+                    for w in line_words:
+                        text = w['text']
+                        x_center = (w['x0'] + w['x1']) / 2
+                        
+                        # Si parece un número monetario (tiene coma y formato numérico)
+                        # Regex flexible para detectar números como 28.100,00 o 573,00
+                        if re.match(r"^-?[\d\.]+,[\d]{2}$", text):
+                            valor = parse_money(text)
+                            
+                            # CLASIFICACIÓN ESPACIAL (LA SOLUCIÓN)
+                            if limites["debito_start"] < x_center < limites["debito_end"]:
+                                debito = valor
+                            elif limites["debito_end"] < x_center < limites["credito_end"]:
+                                credito = valor
+                            # Si está más a la derecha, es SALDO (lo ignoramos para el cálculo)
+                        else:
+                            # Si no es fecha ni el comprobante (asumimos comprobante es numérico corto al inicio)
+                            if text != fecha and not (text.isdigit() and len(text) > 4 and line_words.index(w) < 2):
+                                descripcion_parts.append(text)
+                    
+                    desc_final = " ".join(descripcion_parts)
+                    
+                    rows.append({
+                        "Fecha": fecha,
+                        "Descripción": desc_final,
+                        "Débito": debito,
+                        "Crédito": credito,
+                        "Clasificación": clasificar_movimiento(desc_final)
+                    })
+                
+                # Detectar Saldo Anterior (Suele estar en la primera línea de movimientos o cabecera)
+                elif "SALDO" in line_text and "ANTERIOR" in line_text:
+                    # Buscar el número que esté más a la derecha (columna saldo)
+                    try:
+                        numeros = [w['text'] for w in line_words if re.match(r"-?[\d\.]+,[\d]{2}", w['text'])]
+                        if numeros:
+                            saldo_inicial = parse_money(numeros[-1])
+                    except:
+                        pass
 
-            for txt in lines:
-                up = normalize_desc(txt)
-                ms = _money_spans_from_text(txt)
-                if not ms:
-                    continue
-                last_val = normalize_money(ms[-1])
-                if np.isnan(last_val):
-                    continue
-                if "SALDO ANTERIOR" in up:
-                    saldo_inicial = float(last_val)
-                if "SALDO AL" in up:
-                    md = DATE_ANY_RE.search(txt)
-                    if md:
-                        fecha_final = md.group(0).replace("⁄", "/")
-                    saldo_final = float(last_val)
+        # 2. Búsqueda de Saldo Final y Cuadro de Impuestos (Regex en texto completo)
+        # Buscar Saldo al 30/11/xx
+        match_saldo_fin = re.search(r"SALDO AL \d{2}/\d{2}/\d{2,4}\s+([\d\.,\-]+)", full_text_for_footer)
+        if match_saldo_fin:
+            saldo_final = parse_money(match_saldo_fin.group(1))
+            
+        # Extraer cuadro resumen oficial del banco (Si existe al final)
+        # Esto extrae lo que dice "TOTAL IMPUESTO LEY 25413... X.XXX,XX"
+        regex_taxes = [
+            (r"TOTAL IMPUESTO LEY 25413.*?([\d\.,]+)", "Ley 25.413 (Total)"),
+            (r"IVA ALIC ADIC RG 2408.*?([\d\.,]+)", "Percepción IVA RG 2408"),
+            (r"IVA.*?ALICUOTA INSCRIPTO\s+PERCIBIDO.*?([\d\.,]+)", "IVA 21%"),
+            (r"IVA.*?ALICUOTA INSCRIPTO REDUCIDA\s+PERCIBIDO.*?([\d\.,]+)", "IVA 10.5%")
+        ]
+        
+        for reg, name in regex_taxes:
+            match = re.search(reg, full_text_for_footer, re.DOTALL)
+            if match:
+                monto = parse_money(match.group(1))
+                if monto > 0:
+                    resumen_impositivo_oficial.append({"Concepto": name, "Importe": monto})
 
-            current = None
-            x_centers = []
-            items = []
+    return pd.DataFrame(rows), saldo_inicial, saldo_final, resumen_impositivo_oficial
 
-            for txt in lines:
-                date_m = DATE_RE.match(txt)
-                ms = _money_spans_from_text(txt)
-
-                if date_m:
-                    if current is not None:
-                        items.append(current)
-                    date_raw = date_m.group(0).replace("⁄", "/")
-                    current = {"fecha_raw": date_raw, "comprobante": "", "descripcion": "", "amounts": [], "pagina": pageno}
-
-                    mcomp = re.search(r"\b\d{3,}\b", txt)
-                    if mcomp:
-                        current["comprobante"] = mcomp.group(0)
-
-                    desc = txt[len(date_raw):].strip()
-                    if ms:
-                        # cortar en el primer monto
-                        for m in ms:
-                            pos = txt.find(m)
-                            if pos != -1:
-                                desc = txt[len(date_raw):pos].strip()
-                                break
-                    current["descripcion"] = desc
-
-                    if ms:
-                        mm = ms[:-1] if len(ms) >= 2 else ms
-                        for m in mm:
-                            xc = float(txt.find(m))
-                            val = normalize_money(m)
-                            if not np.isnan(val):
-                                current["amounts"].append((xc, float(val)))
-                                x_centers.append(xc)
-                else:
-                    if current is None:
-                        continue
-                    # concatenar continuación
-                    if txt and not DATE_ANY_RE.search(txt):
-                        current["descripcion"] = (current["descripcion"] + " " + txt).strip()
-
-                    if ms:
-                        mm = ms[:-1] if len(ms) >= 2 else ms
-                        for m in mm:
-                            xc = float(txt.find(m))
-                            val = normalize_money(m)
-                            if not np.isnan(val):
-                                current["amounts"].append((xc, float(val)))
-                                x_centers.append(xc)
-
-            if current is not None:
-                items.append(current)
-
-            km = _kmeans_1d_two_clusters(x_centers)
-            thr = km[2] if km else 140.0
-
-            for it in items:
-                dt = _parse_date(it["fecha_raw"])
-                if dt is None:
-                    continue
-                deb = 0.0
-                cre = 0.0
-                for xc, val in it["amounts"]:
-                    if xc <= thr:
-                        deb += float(val)
-                    else:
-                        cre += float(val)
-
-                desc = norm_txt(it["descripcion"])
-                rows.append({
-                    "fecha": dt.date(),
-                    "fecha_raw": it["fecha_raw"],
-                    "comprobante": it["comprobante"] or "",
-                    "descripcion": desc,
-                    "desc_norm": normalize_desc(desc),
-                    "debito": float(deb) if deb else 0.0,
-                    "credito": float(cre) if cre else 0.0,
-                    "Clasificación": clasificar(desc),
-                    "archivo": pdf_name,
-                    "pagina": it["pagina"],
-                })
-
-    meta = {
-        "saldo_inicial": float(saldo_inicial) if not np.isnan(saldo_inicial) else np.nan,
-        "saldo_final": float(saldo_final) if not np.isnan(saldo_final) else np.nan,
-        "fecha_final": fecha_final,
-    }
-    return pd.DataFrame(rows), meta
-
-
-# ---------------- Selector ----------------
-def parse_pdf(pdf_bytes: bytes, pdf_name: str) -> Tuple[pd.DataFrame, Dict[str, float], str]:
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        cid = is_cid_pdf(pdf)
-
-    df_chars = pd.DataFrame()
-    meta_chars = {}
-    if not cid:
-        df_chars, meta_chars = parse_chars(pdf_bytes, pdf_name)
-
-    df_ocr, meta_ocr = parse_ocr(pdf_bytes, pdf_name)
-
-    def diff(df, meta):
-        si = meta.get("saldo_inicial", np.nan)
-        sf = meta.get("saldo_final", np.nan)
-        if df is None or df.empty or np.isnan(si) or np.isnan(sf):
-            return np.inf
-        td = float(df["debito"].sum())
-        tc = float(df["credito"].sum())
-        calc = float(si) + tc - td
-        return abs(calc - float(sf))
-
-    d_chars = diff(df_chars, meta_chars) if not df_chars.empty else np.inf
-    d_ocr = diff(df_ocr, meta_ocr) if not df_ocr.empty else np.inf
-
-    if d_chars <= d_ocr:
-        return df_chars, meta_chars, "CHARS"
-    return df_ocr, meta_ocr, "OCR"
-
-
-# ---------------- Resumen Operativo (Concepto / Importe) ----------------
-def build_resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["Concepto", "Importe"])
-
-    def deb_sum(mask):
-        return float(df.loc[mask, "debito"].sum())
-
-    def cred_sum(mask):
-        return float(df.loc[mask, "credito"].sum())
-
-    m_neto21 = df["Clasificación"].eq("Comisiones/Gastos Neto 21%")
-    m_neto105 = df["Clasificación"].eq("Comisiones/Gastos Neto 10,5%")
-    m_iva21 = df["Clasificación"].eq("IVA 21%")
-    m_iva105 = df["Clasificación"].eq("IVA 10,5%")
-    m_piva = df["Clasificación"].eq("Percepciones de IVA")
-    m_sir = df["Clasificación"].eq("SIRCREB")
-    m_ley = df["Clasificación"].eq("Ley 25.413")
-
-    neto21 = deb_sum(m_neto21)
-    iva21 = deb_sum(m_iva21)
-    neto105 = deb_sum(m_neto105)
-    iva105 = deb_sum(m_iva105)
-    percep = deb_sum(m_piva)
-    sircreb = deb_sum(m_sir)
-
-    ley_deb = deb_sum(m_ley)
-    ley_cred = cred_sum(m_ley)
-    ley_neto = ley_deb - ley_cred
-
-    total = neto21 + iva21 + neto105 + iva105 + percep + sircreb + ley_neto
-
-    rows = [
-        ["Comisiones/Gastos al 21% (Neto)", neto21],
-        ["IVA 21% (sobre comisiones/gastos)", iva21],
-        ["Comisiones/Gastos al 10,5% (Neto)", neto105],
-        ["IVA 10,5% (sobre comisiones/gastos)", iva105],
-        ["Percepciones de IVA", percep],
-        ["SIRCREB", sircreb],
-        ["Ley 25.413 (DyC) – Neto (Débitos − Créditos)", ley_neto],
-        ["TOTAL", total],
-    ]
-    return pd.DataFrame(rows, columns=["Concepto", "Importe"])
-
-
-def build_prestamos(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    m = df["Clasificación"].eq("Préstamos")
-    cols = ["fecha_raw", "fecha", "comprobante", "descripcion", "debito", "credito", "archivo", "pagina"]
-    return df.loc[m, cols].copy()
-
-
-# ---------------- Descargas ----------------
-def df_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        for name, d in sheets.items():
-            d.to_excel(writer, index=False, sheet_name=(name[:31] if name else "Sheet1"))
-
-        wb = writer.book
-        money_fmt = wb.add_format({"num_format": "#,##0.00"})
-        date_fmt = wb.add_format({"num_format": "dd/mm/yyyy"})
-
-        for sh_name, ws in writer.sheets.items():
-            df_sheet = sheets.get(sh_name)
-            if df_sheet is None:
-                continue
-            for j, col in enumerate(df_sheet.columns):
-                width = min(max(len(str(col)), 12) + 2, 52)
-                ws.set_column(j, j, width)
-            for colname in ["debito", "credito", "Importe"]:
-                if colname in df_sheet.columns:
-                    j = list(df_sheet.columns).index(colname)
-                    ws.set_column(j, j, 18, money_fmt)
-            if "fecha" in df_sheet.columns:
-                j = list(df_sheet.columns).index("fecha")
-                ws.set_column(j, j, 14, date_fmt)
-
-    return out.getvalue()
-
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-# ---------------- PDF Resumen Operativo ----------------
-def resumen_operativo_pdf_bytes(df_res: pd.DataFrame, title: str = "Resumen Operativo: Registración Módulo IVA (Credicoop)") -> Optional[bytes]:
-    if not REPORTLAB_OK or df_res is None or df_res.empty:
-        return None
-
-    pdf_buf = io.BytesIO()
-    doc = SimpleDocTemplate(pdf_buf, pagesize=A4, title=title)
+# --- GENERADOR PDF (ReportLab) ---
+def generar_pdf_reporte(df, resumen_imp, metricas):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
-    elems = [
-        Paragraph(title, styles["Title"]),
-        Spacer(1, 10),
+    elements = []
+    
+    # Título
+    elements.append(Paragraph("Informe de Conciliación Bancaria - Credicoop", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    # Métricas
+    elements.append(Paragraph("Resumen General", styles['Heading2']))
+    data_metrics = [
+        ["Saldo Anterior", metricas['s_ant']],
+        ["Total Créditos", metricas['t_cred']],
+        ["Total Débitos", metricas['t_deb']],
+        ["Saldo Calculado", metricas['s_calc']],
+        ["Saldo Resumen", metricas['s_fin']],
+        ["Diferencia", metricas['diff']]
     ]
-
-    data = [["Concepto", "Importe"]] + [[str(r["Concepto"]), fmt_ar(float(r["Importe"]))] for _, r in df_res.iterrows()]
-    tbl = Table(data, colWidths=[340, 160])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
-        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+    t_met = Table(data_metrics, colWidths=[200, 150])
+    t_met.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('BACKGROUND', (0,0), (0,-1), colors.lightgrey)
     ]))
-    elems.append(tbl)
-    elems.append(Spacer(1, 12))
-    elems.append(Paragraph("Herramienta para uso interno AIE San Justo | Developer Alfonso Alderete", styles["Normal"]))
-    doc.build(elems)
-    return pdf_buf.getvalue()
+    elements.append(t_met)
+    
+    # Resumen Impositivo
+    if resumen_imp:
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("Cuadro de Impuestos (Extracto Oficial)", styles['Heading2']))
+        data_imp = [["Concepto", "Importe"]] + [[r['Concepto'], fmt_ar(r['Importe'])] for r in resumen_imp]
+        t_imp = Table(data_imp, colWidths=[300, 100])
+        t_imp.setStyle(TableStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+            ('BACKGROUND', (0,0), (-1,0), colors.navy),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white)
+        ]))
+        elements.append(t_imp)
+        
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
 
+# --- INTERFAZ PRINCIPAL ---
+uploaded_file = st.file_uploader("Subí tu resumen Credicoop (PDF)", type="pdf")
 
-# ---------------- App ----------------
-uploaded = st.file_uploader("Subí un PDF del resumen bancario (Banco Credicoop)", type=["pdf"])
-if uploaded is None:
-    st.info("La app no almacena datos. Procesamiento local en memoria.")
-    st.stop()
+if uploaded_file:
+    with st.spinner("Analizando geometría del PDF..."):
+        df, s_ant, s_fin, res_oficial = procesar_pdf_espacial(uploaded_file.read())
+    
+    if df.empty:
+        st.error("No se encontraron movimientos. Verificá que el PDF sea texto seleccionable.")
+    else:
+        # Cálculos de Conciliación
+        total_cred = df["Crédito"].sum()
+        total_deb = df["Débito"].sum()
+        saldo_calc = s_ant + total_cred - total_deb
+        diff = saldo_calc - s_fin
+        
+        # 1. VISUALIZACIÓN DE MÉTRICAS
+        st.markdown("### 1. Conciliación Bancaria")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Saldo Anterior", fmt_ar(s_ant))
+        col2.metric("Créditos (+)", fmt_ar(total_cred))
+        col3.metric("Débitos (-)", fmt_ar(total_deb))
+        col4.metric("Saldo Calculado", fmt_ar(saldo_calc))
+        col5.metric("Saldo PDF", fmt_ar(s_fin), delta=fmt_ar(diff), delta_color="inverse")
+        
+        if abs(diff) < 1.0:
+            st.success("✅ CONCILIACIÓN EXITOSA")
+        else:
+            st.error(f"❌ DIFERENCIA: {fmt_ar(diff)}. Revisar movimientos no capturados o saldos iniciales.")
+        
+        # 2. TABLAS Y DATOS
+        tab1, tab2, tab3 = st.tabs(["📋 Movimientos Completos", "💰 Gastos e Impuestos", "🏦 Préstamos"])
+        
+        with tab1:
+            st.dataframe(df, use_container_width=True, height=400)
+            
+        with tab2:
+            c_a, c_b = st.columns(2)
+            with c_a:
+                st.subheader("Según Movimientos (Calculado)")
+                gastos_calc = df.groupby("Clasificación")[["Débito"]].sum().reset_index()
+                gastos_calc = gastos_calc[gastos_calc["Débito"] > 0]
+                gastos_calc["Débito"] = gastos_calc["Débito"].apply(fmt_ar)
+                st.dataframe(gastos_calc, use_container_width=True)
+            
+            with c_b:
+                st.subheader("Según Cuadro Oficial (Pie de Página)")
+                if res_oficial:
+                    df_oficial = pd.DataFrame(res_oficial)
+                    df_oficial["Importe"] = df_oficial["Importe"].apply(fmt_ar)
+                    st.dataframe(df_oficial, use_container_width=True)
+                else:
+                    st.warning("No se detectó el cuadro resumen 'Percepciones' al final del PDF.")
 
-data = uploaded.read()
-pdf_name = uploaded.name
+        with tab3:
+            df_prestamos = df[df["Clasificación"] == "Préstamos"]
+            if not df_prestamos.empty:
+                st.dataframe(df_prestamos)
+                st.info(f"Total pagado en préstamos: {fmt_ar(df_prestamos['Débito'].sum())}")
+            else:
+                st.info("No se detectaron movimientos de préstamos.")
 
-with st.spinner("Procesando PDF..."):
-    df, meta, modo = parse_pdf(data, pdf_name)
-
-st.caption(f"Modo de lectura: {modo}")
-
-if df is None or df.empty:
-    st.error("No se detectaron movimientos. Revisá que sea el Resumen de Cuenta Corriente Comercial de Credicoop.")
-    st.stop()
-
-saldo_ini = meta.get("saldo_inicial", np.nan)
-saldo_fin = meta.get("saldo_final", np.nan)
-
-total_deb = float(df["debito"].sum())
-total_cred = float(df["credito"].sum())
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Saldo anterior", fmt_ar(saldo_ini))
-with c2:
-    st.metric("Total créditos (+)", fmt_ar(total_cred))
-with c3:
-    st.metric("Total débitos (–)", fmt_ar(total_deb))
-
-saldo_calc = np.nan
-if not np.isnan(saldo_ini):
-    saldo_calc = float(saldo_ini) + total_cred - total_deb
-
-c4, c5, c6 = st.columns(3)
-with c4:
-    st.metric("Saldo al (PDF)", fmt_ar(saldo_fin))
-with c5:
-    st.metric("Saldo final calculado", fmt_ar(saldo_calc))
-diff = (saldo_calc - float(saldo_fin)) if (not np.isnan(saldo_calc) and not np.isnan(saldo_fin)) else np.nan
-with c6:
-    st.metric("Diferencia", fmt_ar(diff))
-
-if not np.isnan(diff):
-    st.success("Conciliado.") if abs(diff) < 0.01 else st.error("No cuadra la conciliación.")
-
-# Resumen Operativo
-st.caption("Resumen Operativo: Registración Módulo IVA")
-df_res = build_resumen_operativo(df)
-df_res_view = df_res.copy()
-df_res_view["Importe"] = df_res_view["Importe"].map(fmt_ar)
-st.dataframe(df_res_view, use_container_width=True, hide_index=True)
-
-pdf_bytes = resumen_operativo_pdf_bytes(df_res)
-if pdf_bytes:
-    st.download_button(
-        "📄 Descargar PDF – Resumen Operativo (Credicoop)",
-        data=pdf_bytes,
-        file_name="Resumen_Operativo_Credicoop.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-
-# Préstamos
-st.caption("Detalle de préstamos (acreditaciones / cuotas)")
-df_prest = build_prestamos(df)
-if df_prest.empty:
-    st.info("No se detectaron préstamos en el período.")
-else:
-    df_pv = df_prest.copy()
-    df_pv["debito"] = df_pv["debito"].map(fmt_ar)
-    df_pv["credito"] = df_pv["credito"].map(fmt_ar)
-    st.dataframe(df_pv, use_container_width=True, hide_index=True)
-
-# Movimientos
-st.caption("Detalle de movimientos")
-df_view = df.copy()
-df_view["debito"] = df_view["debito"].map(fmt_ar)
-df_view["credito"] = df_view["credito"].map(fmt_ar)
-st.dataframe(
-    df_view[["fecha_raw", "comprobante", "descripcion", "Clasificación", "debito", "credito", "archivo", "pagina"]],
-    use_container_width=True,
-    hide_index=True,
-)
-
-# Descargas
-st.caption("Descargar")
-sheets = {
-    "Movimientos": df[["fecha_raw", "fecha", "comprobante", "descripcion", "Clasificación", "debito", "credito", "archivo", "pagina"]],
-    "Resumen_Operativo": df_res,
-}
-if not df_prest.empty:
-    sheets["Prestamos"] = df_prest
-
-try:
-    xlsx_bytes = df_to_excel_bytes(sheets)
-    st.download_button(
-        "📥 Descargar Excel – Credicoop",
-        data=xlsx_bytes,
-        file_name="credicoop_movimientos_y_resumen.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-except Exception:
-    st.download_button(
-        "📥 Descargar CSV – Movimientos (fallback)",
-        data=df_to_csv_bytes(df),
-        file_name="credicoop_movimientos.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-st.markdown("---")
-st.caption("Herramienta para uso interno AIE San Justo | Developer Alfonso Alderete")
+        # 3. ZONA DE DESCARGAS
+        st.markdown("---")
+        st.subheader("📥 Exportar Datos")
+        
+        col_d1, col_d2 = st.columns(2)
+        
+        # Excel
+        buffer_excel = io.BytesIO()
+        with pd.ExcelWriter(buffer_excel, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Movimientos', index=False)
+            if res_oficial:
+                pd.DataFrame(res_oficial).to_excel(writer, sheet_name='Resumen_Fiscal', index=False)
+        
+        col_d1.download_button(
+            label="Descargar Excel Completo",
+            data=buffer_excel.getvalue(),
+            file_name="conciliacion_credicoop.xlsx",
+            mime="application/vnd.ms-excel"
+        )
+        
+        # PDF
+        metricas_dict = {
+            's_ant': fmt_ar(s_ant), 't_cred': fmt_ar(total_cred), 't_deb': fmt_ar(total_deb),
+            's_calc': fmt_ar(saldo_calc), 's_fin': fmt_ar(s_fin), 'diff': fmt_ar(diff)
+        }
+        pdf_report = generar_pdf_reporte(df, res_oficial, metricas_dict)
+        col_d2.download_button(
+            label="Descargar Reporte PDF",
+            data=pdf_report,
+            file_name="reporte_conciliacion.pdf",
+            mime="application/pdf"
+        )

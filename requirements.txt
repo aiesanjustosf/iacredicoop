@@ -1,7 +1,5 @@
 streamlit
 pandas
-pdfplumber
-reportlab
-xlsxwriter
 openpyxl
-numpy
+xlsxwriter
+pdfplumber

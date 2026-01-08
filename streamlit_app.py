@@ -2,27 +2,39 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+import os
 from io import BytesIO
 from fpdf import FPDF
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="IA Resumen Bancario", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA Y ESTILO ---
+st.set_page_config(page_title="IA Resumen Bancario - AIE", layout="wide")
 
-# --- FUNCIONES DE LIMPIEZA Y FORMATO ---
+# CSS para tarjetas y estilo
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- FUNCIONES AUXILIARES ---
 
 def limpiar_numero_ar(valor):
-    """Convierte '1.000,00' a float de forma segura."""
+    """Convierte '1.000,00' a float."""
     if not valor: return 0.0
     if isinstance(valor, (int, float)): return float(valor)
-    
     val_str = str(valor).strip()
     es_negativo = False
     if val_str.endswith("-") or (val_str.startswith("(") and val_str.endswith(")")):
         es_negativo = True
-    
     val_str = re.sub(r'[^\d,.]', '', val_str)
     if not val_str: return 0.0
-        
     try:
         val_str = val_str.replace(".", "").replace(",", ".")
         num = float(val_str)
@@ -34,156 +46,148 @@ def formatear_moneda_ar(valor):
     if pd.isna(valor) or valor == "": return ""
     return "{:,.2f}".format(valor).replace(",", "X").replace(".", ",").replace("X", ".")
 
-# --- GENERACIÓN DE PDF RESUMEN OPERATIVO ---
-
+# --- GENERADOR DE PDF (RESUMEN IMPOSITIVO) ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 12)
-        self.cell(0, 10, 'Resumen Operativo - Impuestos y Gastos', 0, 1, 'C')
+        self.cell(0, 10, 'Resumen Operativo - Impuestos y Tasas', 0, 1, 'C')
         self.line(10, 20, 200, 20)
         self.ln(10)
 
-def generar_pdf_resumen(texto_resumen):
+def generar_pdf_resumen(texto):
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_font("Arial", size=10)
-    
-    # Procesar texto línea por línea
-    lines = texto_resumen.split('\n')
-    for line in lines:
+    for line in texto.split('\n'):
         if line.strip():
-            # Intentar detectar títulos vs datos
-            if "IMPUESTO" in line or "IVA" in line or "PERCEPCION" in line:
-                 pdf.set_font("Arial", 'B', 10)
-            else:
-                 pdf.set_font("Arial", '', 10)
-            
-            # Limpieza de caracteres raros
             safe_line = line.encode('latin-1', 'replace').decode('latin-1')
-            pdf.multi_cell(0, 8, safe_line)
-            
+            pdf.multi_cell(0, 7, safe_line)
+    
     buffer = BytesIO()
-    pdf_content = pdf.output(dest='S').encode('latin-1')
-    buffer.write(pdf_content)
+    # Output devuelve string en versiones viejas o bytes en nuevas, ajustamos:
+    try:
+        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+    except:
+        pdf_bytes = pdf.output(dest='S')
+        
+    buffer.write(pdf_bytes)
     return buffer.getvalue()
 
-# --- MOTOR DE LECTURA INTELIGENTE ---
+# --- PROCESAMIENTO PRINCIPAL ---
 
-def procesar_completo(pdf_file):
+def procesar_pdf(pdf_file, x_coords):
     movimientos = []
-    texto_resumen_operativo = ""
+    texto_impuestos = ""
     saldo_anterior = 0.0
     
-    # Banderas de control
-    fin_grilla_detectado = False
-    
-    # COORDENADAS FIJAS OPTIMIZADAS (Credicoop Estándar)
-    # Ajusté "Fin Descripción" a 310 para que no se coma los créditos largos
-    x_coords = [0, 60, 310, 480, 580, 1000] 
+    # Coordenadas manuales (Sliders)
+    x_fecha, x_desc, x_debito, x_credito = x_coords
     
     with pdfplumber.open(pdf_file) as pdf:
-        # 1. Buscar Saldo Anterior (Página 1)
+        # 1. Saldo Anterior (Pág 1)
         if len(pdf.pages) > 0:
-            p1_text = pdf.pages[0].extract_text()
-            match = re.search(r"Saldo anterior[:\s]+([\d.,\-]+)", p1_text, re.IGNORECASE)
-            if match:
-                saldo_anterior = limpiar_numero_ar(match.group(1))
+            p1 = pdf.pages[0].extract_text() or ""
+            m = re.search(r"Saldo anterior[:\s]+([\d.,\-]+)", p1, re.IGNORECASE)
+            if m: saldo_anterior = limpiar_numero_ar(m.group(1))
 
-        # 2. Iterar Páginas
+        # 2. Procesar páginas
+        fin_grilla = False
+        
         for page in pdf.pages:
-            # A) Si ya terminó la grilla, todo es resumen operativo
-            if fin_grilla_detectado:
-                texto_resumen_operativo += page.extract_text() + "\n"
-                continue
+            p_text = page.extract_text() or ""
             
-            # B) Si estamos en la grilla, buscamos "SALDO AL"
-            page_text = page.extract_text()
-            if "SALDO AL" in page_text:
-                # Aquí pasa la transición
-                fin_grilla_detectado = True
-                
-                # Separar texto: Lo que está después de "SALDO AL" va al resumen
-                parts = page_text.split("SALDO AL")
+            # Detectar corte "SALDO AL"
+            if "SALDO AL" in p_text and not fin_grilla:
+                fin_grilla = True
+                parts = p_text.split("SALDO AL")
                 if len(parts) > 1:
-                    # La parte derecha es el inicio del resumen (fecha y saldo final)
-                    texto_resumen_operativo += "SALDO AL" + parts[1] + "\n"
+                    texto_impuestos += "SALDO AL" + parts[1] + "\n"
+            elif fin_grilla:
+                texto_impuestos += p_text + "\n"
+            
+            # Extraer tabla (Solo si no terminó la grilla o es la página de transición)
+            if not fin_grilla or "SALDO AL" in p_text:
+                # Líneas verticales explícitas
+                lines = [0, x_fecha, x_desc, x_debito, x_credito, page.width]
+                settings = {
+                    "vertical_strategy": "explicit", 
+                    "explicit_vertical_lines": lines,
+                    "horizontal_strategy": "text",
+                    "intersection_y_tolerance": 5
+                }
                 
-                # Intentamos leer la tabla HASTA ese punto (o la página entera, filtrando después)
-                # Por seguridad, procesamos esta página como tabla también
-            
-            # C) Extracción de Tabla (Grilla)
-            settings = {
-                "vertical_strategy": "explicit",
-                "explicit_vertical_lines": x_coords,
-                "horizontal_strategy": "text",
-                "intersection_y_tolerance": 5
-            }
-            table = page.extract_table(settings)
-            
-            if table:
-                for row in table:
-                    # Limpieza básica
-                    row = [c.strip() if c else "" for c in row]
-                    
-                    # FILTRO: Solo es movimiento si empieza con fecha DD/MM/YY
-                    if len(row) >= 5 and re.match(r'\d{2}/\d{2}/\d{2}', row[0]):
-                        try:
-                            # Ignorar línea si dice "SALDO AL" dentro de la tabla
+                table = page.extract_table(settings)
+                
+                if table:
+                    for row in table:
+                        row = [c.strip() if c else "" for c in row]
+                        # Validar fecha al inicio y evitar leer la linea de "SALDO AL" dentro de la tabla
+                        if len(row) >= 5 and re.match(r'\d{2}/\d{2}/\d{2}', row[0]):
                             if "SALDO AL" in row[1]: continue
-                            
-                            movimientos.append({
-                                "Fecha": row[0],
-                                "Descripcion": row[1],
-                                "Debito": limpiar_numero_ar(row[2]),
-                                "Credito": limpiar_numero_ar(row[3]),
-                                "Saldo_PDF": limpiar_numero_ar(row[4])
-                            })
-                        except:
-                            pass
+                            try:
+                                movimientos.append({
+                                    "Fecha": row[0],
+                                    "Descripcion": row[1],
+                                    "Debito": limpiar_numero_ar(row[2]),
+                                    "Credito": limpiar_numero_ar(row[3]),
+                                    "Saldo_PDF": limpiar_numero_ar(row[4])
+                                })
+                            except: pass
 
-    df = pd.DataFrame(movimientos)
-    return df, saldo_anterior, texto_resumen_operativo
+    return pd.DataFrame(movimientos), saldo_anterior, texto_impuestos
 
-# --- INTERFAZ DE USUARIO ---
+# --- INTERFAZ GRÁFICA ---
 
-# Cabecera
-c_logo, c_tit = st.columns([1, 5])
-with c_logo:
-    try:
-        st.image("logo_aie.png", width=100)
-    except:
-        st.write("📂")
-with c_tit:
+# 1. Cabecera con Logo
+col_l, col_t = st.columns([1, 5])
+with col_l:
+    if os.path.exists("logo_aie.png"):
+        st.image("logo_aie.png", width=120)
+    else:
+        st.warning("⚠️ Subí 'logo_aie.png'")
+with col_t:
     st.title("IA Resumen Bancario – Banco Credicoop")
 
 st.markdown("---")
 
-uploaded_file = st.file_uploader("Subí tu Resumen (PDF)", type="pdf")
+col_conf, col_main = st.columns([1, 3])
+
+with col_conf:
+    st.header("⚙️ Ajustes")
+    st.info("Si la tabla sale vacía o cortada, mové estos controles:")
+    
+    # SLIDERS (Fundamental para que ande siempre)
+    x_fecha = st.slider("Fin Fecha", 0, 120, 60)
+    x_desc = st.slider("Fin Descripción", 100, 500, 310, help="Achicá este número si te come los Créditos")
+    x_debito = st.slider("Fin Débito", 300, 600, 480)
+    x_credito = st.slider("Fin Crédito", 400, 700, 580)
+    
+    uploaded_file = st.file_uploader("Subir PDF", type="pdf")
 
 if uploaded_file:
-    with st.spinner('Procesando grilla y detectando impuestos...'):
-        df, saldo_ini, texto_resumen = procesar_completo(uploaded_file)
+    # Procesar
+    x_coords = [x_fecha, x_desc, x_debito, x_credito]
+    df, saldo_ini_auto, txt_resumen = procesar_pdf(uploaded_file, x_coords)
     
-    # Sección Saldo (Editable)
-    col_input, col_kpi = st.columns([1, 3])
-    with col_input:
-        saldo_inicial = st.number_input("Saldo Anterior", value=saldo_ini, step=1000.0)
-        
+    with col_conf:
+        saldo_inicial = st.number_input("Saldo Anterior", value=saldo_ini_auto, step=1000.0)
+
+    # Validar si hay datos
     if df.empty:
-        st.error("⚠️ No se pudieron leer movimientos. El PDF podría ser una imagen escaneada.")
+        st.warning("⚠️ No se leyeron datos. Por favor, ajustá los Sliders a la izquierda.")
     else:
-        # --- LÓGICA DE CONCILIACIÓN ---
+        # Conciliar
         df['Saldo_Calculado'] = 0.0
         df['Estado'] = 'OK'
         df['Diferencia'] = 0.0
         
         acum = saldo_inicial
-        total_cred = df['Credito'].sum()
-        total_deb = df['Debito'].sum()
+        t_cred = df['Credito'].sum()
+        t_deb = df['Debito'].sum()
         
         for i, row in df.iterrows():
             acum += (row['Credito'] - row['Debito'])
-            df.at[i, 'Saldo_Calculado'] = acumul
+            df.at[i, 'Saldo_Calculado'] = acum
             
             if row['Saldo_PDF'] != 0:
                 diff = round(acum - row['Saldo_PDF'], 2)
@@ -191,75 +195,57 @@ if uploaded_file:
                     df.at[i, 'Estado'] = 'ERROR'
                     df.at[i, 'Diferencia'] = diff
                 else:
-                    acum = row['Saldo_PDF'] # Sincronizar
+                    acum = row['Saldo_PDF']
         
-        saldo_final = acumul
+        saldo_final = acum
 
-        # --- MOSTRAR RESULTADOS ---
-        with col_kpi:
+        # --- RESULTADOS ---
+        with col_main:
+            # Tarjetas Métricas
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Saldo Ant.", formatear_moneda_ar(saldo_inicial))
-            m2.metric("Créditos", formatear_moneda_ar(total_cred))
-            m3.metric("Débitos", formatear_moneda_ar(total_deb))
+            m1.metric("Saldo Anterior", formatear_moneda_ar(saldo_inicial))
+            m2.metric("Créditos", formatear_moneda_ar(t_cred))
+            m3.metric("Débitos", formatear_moneda_ar(t_deb))
             
-            # Alerta de diferencia
             errores = df[df['Estado'] == 'ERROR']
             if not errores.empty:
                 m4.metric("Saldo Final", formatear_moneda_ar(saldo_final), "Diferencia", delta_color="inverse")
-                st.toast(f"⚠️ Hay {len(errores)} errores de conciliación", icon="❌")
+                st.error(f"❌ {len(errores)} Errores de Conciliación")
             else:
                 m4.metric("Saldo Final", formatear_moneda_ar(saldo_final), "Ok")
 
-        # --- TABS: GRILLA Y RESUMEN ---
-        tab1, tab2 = st.tabs(["📊 Movimientos (Excel)", "📑 Resumen Operativo (Impuestos)"])
-        
-        with tab1:
-            st.subheader("Conciliación de Movimientos")
-            if not errores.empty:
-                st.error("Filas con diferencias de saldo:")
-                st.dataframe(errores[['Fecha', 'Descripcion', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']])
+            # PESTAÑAS: MOVIMIENTOS Y RESUMEN
+            tab_mov, tab_res = st.tabs(["📂 Movimientos (Excel)", "📑 Resumen Impositivo (PDF)"])
             
-            # Tabla completa
-            df_show = df.copy()
-            for c in ['Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']:
-                df_show[c] = df_show[c].apply(formatear_moneda_ar)
-            st.dataframe(df_show, height=400, use_container_width=True)
-            
-            # Descarga Excel
-            buffer_excel = BytesIO()
-            with pd.ExcelWriter(buffer_excel, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False)
-            
-            st.download_button(
-                "📥 Descargar Excel (.xlsx)", 
-                data=buffer_excel.getvalue(), 
-                file_name="conciliacion_credicoop.xlsx",
-                mime="application/vnd.ms-excel"
-            )
+            with tab_mov:
+                if not errores.empty:
+                    st.dataframe(errores[['Fecha','Descripcion','Saldo_PDF','Saldo_Calculado','Diferencia']])
+                
+                df_show = df.copy()
+                for c in ['Debito','Credito','Saldo_PDF','Saldo_Calculado','Diferencia']:
+                    df_show[c] = df_show[c].apply(formatear_moneda_ar)
+                
+                st.dataframe(df_show, use_container_width=True, height=450)
+                
+                # Botón Excel
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False)
+                st.download_button("📥 Descargar Excel", buffer.getvalue(), "conciliacion.xlsx")
 
-        with tab2:
-            st.subheader("Resumen de Impuestos, Tasas y Comisiones")
-            st.info("Este texto se extrajo del final del resumen (después de 'SALDO AL').")
-            
-            col_txt, col_pdf = st.columns([3, 1])
-            
-            with col_txt:
-                st.text_area("Vista Previa Texto", texto_resumen, height=300)
-            
-            with col_pdf:
-                st.write("Generar reporte PDF:")
-                # Generar PDF en memoria
-                if texto_resumen.strip():
-                    pdf_bytes = generar_pdf_resumen(texto_resumen)
-                    st.download_button(
-                        "📄 Descargar Resumen (.pdf)",
-                        data=pdf_bytes,
-                        file_name="resumen_operativo_impositivo.pdf",
-                        mime="application/pdf",
-                        type="primary"
-                    )
+            with tab_res:
+                st.subheader("Impuestos, Tasas y Comisiones")
+                if txt_resumen.strip():
+                    col_txt, col_dl = st.columns([3, 1])
+                    with col_txt:
+                        st.text_area("Texto Detectado", txt_resumen, height=300)
+                    with col_dl:
+                        st.write("Generar PDF:")
+                        pdf_data = generar_pdf_resumen(txt_resumen)
+                        st.download_button("📄 Descargar Resumen", pdf_data, "resumen_impositivo.pdf", mime="application/pdf", type="primary")
                 else:
-                    st.warning("No se detectó resumen operativo en este archivo.")
+                    st.info("No se encontró la sección 'SALDO AL' para extraer impuestos.")
 
 else:
-    st.info("Esperando archivo PDF...")
+    with col_main:
+        st.info("Esperando archivo...")

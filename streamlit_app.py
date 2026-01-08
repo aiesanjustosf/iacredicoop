@@ -1,157 +1,363 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
+import pdfplumber
 import re
-from io import BytesIO
+import io
+import os
 
-# Configuración inicial para evitar errores si falta fpdf
+# --- INTENTO DE IMPORTAR LIBRERÍAS DE IMAGEN (OCR) ---
 try:
-    from fpdf import FPDF
-    TIENE_FPDF = True
+    import pytesseract
+    from pytesseract import Output
+    from pdf2image import convert_from_bytes
+    from PIL import Image
 except ImportError:
-    TIENE_FPDF = False
+    pass 
 
-st.set_page_config(page_title="IA Resumen Bancario", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA Y FAVICON ---
+st.set_page_config(
+    page_title="Conciliador AIE",
+    page_icon="favicon.ico", # Aquí toma tu icono
+    layout="centered"
+)
 
-# --- ESTILOS ---
+# --- CSS PERSONALIZADO (ESTÉTICA AIE) ---
 st.markdown("""
-<style>
+    <style>
+    /* Estilo de las Tarjetas de Métricas */
+    .metric-container {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 20px;
+    }
     .metric-card {
+        background-color: #ffffff;
         padding: 15px;
         border-radius: 8px;
-        border: 1px solid #e0e0e0;
-        background-color: #f9f9f9;
+        border-left: 5px solid #E30613; /* Rojo Institucional */
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         text-align: center;
-        margin-bottom: 10px;
+        flex: 1;
     }
-</style>
+    .metric-value {
+        font-size: 22px;
+        font-weight: bold;
+        color: #333;
+        margin-top: 5px;
+    }
+    .metric-label {
+        font-size: 13px;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    /* Cajas de Estado (Check) */
+    .status-box {
+        padding: 15px;
+        border-radius: 8px;
+        text-align: center;
+        font-weight: bold;
+        margin-top: 10px;
+        margin-bottom: 20px;
+    }
+    .success {
+        background-color: #d1e7dd;
+        color: #0f5132;
+        border: 1px solid #badbcc;
+    }
+    .danger {
+        background-color: #f8d7da;
+        color: #842029;
+        border: 1px solid #f5c2c7;
+    }
+    </style>
 """, unsafe_allow_html=True)
 
 # --- FUNCIONES DE LIMPIEZA ---
-def limpiar_numero_ar(valor):
-    if not valor: return 0.0
-    if isinstance(valor, (int, float)): return float(valor)
-    val_str = str(valor).strip()
-    es_negativo = False
-    if val_str.endswith("-") or (val_str.startswith("(") and val_str.endswith(")")):
-        es_negativo = True
-    val_str = re.sub(r'[^\d,.]', '', val_str)
-    if not val_str: return 0.0
+
+def limpiar_monto(texto):
+    """Convierte '1.050,50' a float 1050.50"""
     try:
-        val_str = val_str.replace(".", "").replace(",", ".")
-        num = float(val_str)
-        return -num if es_negativo else num
+        limpio = re.sub(r'[^\d.,-]', '', texto)
+        limpio = limpio.replace('.', '').replace(',', '.')
+        return float(limpio)
     except:
         return 0.0
 
-def formatear_moneda_ar(valor):
-    if pd.isna(valor) or valor == "": return ""
-    return "{:,.2f}".format(valor).replace(",", "X").replace(".", ",").replace("X", ".")
+def es_numero_argentino(texto):
+    # Detecta formato X.XXX,XX
+    return bool(re.match(r'^-?[\d\.]+,\d{2}$', texto))
 
-# --- GENERACIÓN DE PDF (RESUMEN OPERATIVO) ---
-class PDFReport(FPDF):
-    def header(self):
-        self.set_font('Arial', 'B', 12)
-        self.cell(0, 10, 'Resumen Operativo - Impuestos y Gastos', 0, 1, 'C')
-        self.line(10, 20, 200, 20)
-        self.ln(10)
+# --- PROCESAMIENTO NATIVO (TEXTO) ---
+def procesar_nativo(pdf_bytes, x_corte):
+    datos = []
+    saldo_inicial = 0.0
+    saldo_final_pdf = 0.0
+    encontrado_saldo_final = False
 
-def generar_pdf_resumen(texto):
-    if not TIENE_FPDF: return None
-    pdf = PDFReport()
-    pdf.add_page()
-    pdf.set_font("Arial", size=10)
-    for line in texto.split('\n'):
-        safe_line = line.encode('latin-1', 'replace').decode('latin-1')
-        pdf.multi_cell(0, 7, safe_line)
-    
-    buffer = BytesIO()
-    try:
-        pdf_bytes = pdf.output(dest='S').encode('latin-1')
-    except:
-        pdf_bytes = pdf.output(dest='S')
-    buffer.write(pdf_bytes)
-    return buffer.getvalue()
-
-# --- PROCESAMIENTO PRINCIPAL ---
-def procesar_pdf(pdf_file, x_coords):
-    movimientos = []
-    texto_resumen = ""
-    saldo_anterior = 0.0
-    
-    # Desempaquetar sliders
-    x_fecha, x_desc, x_debito, x_credito = x_coords
-
-    with pdfplumber.open(pdf_file) as pdf:
-        # 1. Buscar Saldo Anterior (Pág 1)
-        if len(pdf.pages) > 0:
-            p1 = pdf.pages[0].extract_text() or ""
-            m = re.search(r"Saldo anterior[:\s]+([\d.,\-]+)", p1, re.IGNORECASE)
-            if m: saldo_anterior = limpiar_numero_ar(m.group(1))
-
-        # 2. Leer páginas
-        fin_grilla = False
-        
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            texto_pag = page.extract_text() or ""
-            
-            # Detectar fin de la tabla (Sección Impuestos)
-            if "SALDO AL" in texto_pag:
-                fin_grilla = True
-                parts = texto_pag.split("SALDO AL")
-                if len(parts) > 1:
-                    texto_resumen += "SALDO AL" + parts[1] + "\n"
-            elif fin_grilla:
-                texto_resumen += texto_pag + "\n"
-            
-            # Leer Grilla (mientras no hayamos terminado o estemos en la pagina de transición)
-            if not fin_grilla or "SALDO AL" in texto_pag:
-                # Definir líneas verticales manuales
-                lines = [0, x_fecha, x_desc, x_debito, x_credito, page.width]
-                
-                settings = {
-                    "vertical_strategy": "explicit",
-                    "explicit_vertical_lines": lines,
-                    "horizontal_strategy": "text",
-                    "intersection_y_tolerance": 5
-                }
-                
-                table = page.extract_table(settings)
-                
-                if table:
-                    for row in table:
-                        row = [c.strip() if c else "" for c in row]
-                        # Validar si es movimiento (Fecha DD/MM/YY)
-                        if len(row) >= 5 and re.match(r'\d{2}/\d{2}/\d{2}', row[0]):
-                            # Evitar leer la línea de totales como movimiento
-                            if "SALDO AL" in row[1]: continue
-                            
-                            try:
-                                movimientos.append({
-                                    "Fecha": row[0],
-                                    "Descripcion": row[1],
-                                    "Debito": limpiar_numero_ar(row[2]),
-                                    "Credito": limpiar_numero_ar(row[3]),
-                                    "Saldo_PDF": limpiar_numero_ar(row[4])
-                                })
-                            except: pass
+            if encontrado_saldo_final: break
 
-    return pd.DataFrame(movimientos), saldo_anterior, texto_resumen
+            words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
+            filas = {}
+            for w in words:
+                y = round(w['top'])
+                if y not in filas: filas[y] = []
+                filas[y].append(w)
+            
+            for y in sorted(filas.keys()):
+                fila_words = sorted(filas[y], key=lambda x: x['x0'])
+                texto_completo = " ".join([w['text'] for w in fila_words])
+                texto_upper = texto_completo.upper()
+
+                # 1. SALDO ANTERIOR
+                if "SALDO ANTERIOR" in texto_upper:
+                    nums = [w for w in fila_words if es_numero_argentino(w['text'])]
+                    if nums: saldo_inicial = limpiar_monto(nums[-1]['text'])
+                    continue 
+
+                # 2. SALDO FINAL (STOP)
+                if "SALDO AL" in texto_upper:
+                    nums = [w for w in fila_words if es_numero_argentino(w['text'])]
+                    if nums: saldo_final_pdf = limpiar_monto(nums[-1]['text'])
+                    encontrado_saldo_final = True
+                    break
+
+                # 3. MOVIMIENTOS
+                match_fecha = re.match(r'\d{2}/\d{2}/\d{2}', fila_words[0]['text'])
+                if not match_fecha: continue
+                
+                fecha = match_fecha.group(0)
+                candidatos = [w for w in fila_words if es_numero_argentino(w['text'])]
+                if not candidatos: continue
+
+                item_importe = None
+                if len(candidatos) >= 2:
+                    item_importe = candidatos[-2]
+                elif len(candidatos) == 1:
+                    item_importe = candidatos[0]
+                    if item_importe['x0'] > 520: continue 
+
+                if not item_importe: continue
+
+                monto = limpiar_monto(item_importe['text'])
+                # Lógica visual pura
+                debito = monto if item_importe['x0'] < x_corte else 0.0
+                credito = monto if item_importe['x0'] >= x_corte else 0.0
+
+                desc_tokens = [w['text'] for w in fila_words if w != item_importe and w not in candidatos and w['text'] != fecha]
+                
+                datos.append({
+                    "Fecha": fecha,
+                    "Descripción": " ".join(desc_tokens).strip(),
+                    "Débito": debito,
+                    "Crédito": credito
+                })
+
+    return pd.DataFrame(datos), saldo_inicial, saldo_final_pdf
+
+# --- PROCESAMIENTO OCR (IMAGEN) ---
+def procesar_ocr_posicional(pdf_bytes, x_corte_relativo=0.65):
+    try:
+        images = convert_from_bytes(pdf_bytes)
+    except:
+        return pd.DataFrame(), 0.0, 0.0
+
+    datos = []
+    saldo_inicial = 0.0
+    saldo_final_pdf = 0.0
+    encontrado_saldo_final = False
+    
+    custom_config = r'--oem 3 --psm 6'
+
+    for img in images:
+        if encontrado_saldo_final: break
+        width, height = img.size
+        ocr_data = pytesseract.image_to_data(img, config=custom_config, output_type=Output.DICT, lang='spa')
+        
+        # Agrupar lineas OCR
+        lineas = {}
+        for i in range(len(ocr_data['text'])):
+            if int(ocr_data['conf'][i]) > 0:
+                txt = ocr_data['text'][i].strip()
+                if not txt: continue
+                top = ocr_data['top'][i]
+                found = False
+                for t in lineas:
+                    if abs(t - top) < 10: # Tolerancia vertical
+                        lineas[t].append({'text': txt, 'left': ocr_data['left'][i]})
+                        found = True
+                        break
+                if not found: lineas[top] = [{'text': txt, 'left': ocr_data['left'][i]}]
+
+        for top in sorted(lineas.keys()):
+            words = sorted(lineas[top], key=lambda x: x['left'])
+            texto_linea = " ".join([w['text'] for w in words]).upper()
+            
+            # 1. SALDO ANTERIOR
+            if "SALDO ANTERIOR" in texto_linea:
+                nums = [w for w in words if es_numero_argentino(w['text'])]
+                if nums: saldo_inicial = limpiar_monto(nums[-1]['text'])
+                continue
+
+            # 2. SALDO FINAL
+            if "SALDO AL" in texto_linea:
+                nums = [w for w in words if es_numero_argentino(w['text'])]
+                if nums: saldo_final_pdf = limpiar_monto(nums[-1]['text'])
+                encontrado_saldo_final = True
+                break
+
+            # 3. MOVIMIENTOS
+            match_fecha = re.match(r'\d{2}/\d{2}/\d{2}', words[0]['text'])
+            if not match_fecha: continue
+            
+            fecha = match_fecha.group(0)
+            candidatos = [w for w in words if es_numero_argentino(w['text'])]
+            if not candidatos: continue
+
+            item_importe = None
+            if len(candidatos) >= 2:
+                item_importe = candidatos[-2]
+            elif len(candidatos) == 1:
+                item_importe = candidatos[0]
+                if (item_importe['left'] / width) > 0.85: continue
+
+            if not item_importe: continue
+            
+            monto = limpiar_monto(item_importe['text'])
+            pos_rel = item_importe['left'] / width
+            
+            debito = monto if pos_rel < x_corte_relativo else 0.0
+            credito = monto if pos_rel >= x_corte_relativo else 0.0
+            
+            raw_desc = texto_linea.replace(fecha, "").replace(item_importe['text'], "")
+            
+            datos.append({
+                "Fecha": fecha,
+                "Descripción": raw_desc.strip(),
+                "Débito": debito,
+                "Crédito": credito
+            })
+
+    return pd.DataFrame(datos), saldo_inicial, saldo_final_pdf
+
 
 # --- INTERFAZ DE USUARIO ---
 
-# Encabezado
-c1, c2 = st.columns([1, 5])
-with c1:
+with st.sidebar:
+    # Cargar Logo si existe
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
+    else:
+        st.warning("No se encontró 'logo.png' en el repo")
+        
+    st.markdown("### Procesador Bancario")
+    st.info("Detecta automáticamente si es PDF de texto o imagen.")
+    
+    st.divider()
+    st.write("**Calibración Fina**")
+    x_corte_nativo = st.slider("Corte Visual (PDF Texto)", 300, 500, 400)
+    x_corte_ocr = st.slider("Corte Visual (OCR %)", 0.4, 0.9, 0.65)
+    
+    uploaded_file = st.file_uploader("Subir Archivo (.pdf)", type=["pdf"])
+
+st.title("Conciliación Automática Credicoop")
+
+if uploaded_file:
+    bytes_data = uploaded_file.read()
+    
+    # Procesar
     try:
-        st.image("logo_aie.png", width=100)
-    except:
-        st.warning("Falta logo")
-with c2:
-    st.title("IA Resumen Bancario – Banco Credicoop")
+        # 1. Intento Nativo
+        df, s_ini, s_fin = procesar_nativo(bytes_data, x_corte_nativo)
+        origen = "Lectura Digital (Texto)"
+        
+        if df.empty:
+             # 2. Intento OCR
+             with st.spinner("⏳ PDF escaneado detectado. Aplicando IA (esto demora unos segundos)..."):
+                df, s_ini, s_fin = procesar_ocr_posicional(bytes_data, x_corte_ocr)
+                origen = "Lectura OCR (Imagen)"
 
-st.markdown("---")
+    except Exception as e:
+        st.error(f"Error procesando archivo: {e}")
+        df = pd.DataFrame()
 
-col_izq, col_der = st.columns([1, 3])
+    if not df.empty:
+        # --- CÁLCULOS ---
+        t_deb = df["Débito"].sum()
+        t_cre = df["Crédito"].sum()
+        
+        # Fórmula: Saldo Inicial + (Créditos - Débitos) = Saldo Calculado
+        saldo_calc = s_ini + t_cre - t_deb
+        diferencia = saldo_calc - s_fin
+        concilia = abs(diferencia) < 1.00 # Tolerancia $1
 
-with col_iz
+        # --- TARJETAS DE CONCILIACIÓN ---
+        # HTML personalizado para mostrar las 4 tarjetas en fila
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-card">
+                <div class="metric-label">Saldo Anterior</div>
+                <div class="metric-value">${s_ini:,.2f}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total Créditos</div>
+                <div class="metric-value" style="color: #198754;">+${t_cre:,.2f}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total Débitos</div>
+                <div class="metric-value" style="color: #dc3545;">-${t_deb:,.2f}</div>
+            </div>
+            <div class="metric-card" style="border-left: 5px solid #0d6efd;">
+                <div class="metric-label">Saldo Calculado</div>
+                <div class="metric-value" style="color: #0d6efd;">${saldo_calc:,.2f}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # --- CHECK DE VALIDACIÓN ---
+        if concilia:
+            st.markdown(f"""
+            <div class="status-box success">
+                ✅ CONCILIACIÓN CORRECTA <br>
+                El saldo calculado coincide con el resumen (${s_fin:,.2f})
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="status-box danger">
+                ⚠️ ERROR DE CONCILIACIÓN <br>
+                Saldo PDF: ${s_fin:,.2f} vs Calculado: ${saldo_calc:,.2f} <br>
+                Diferencia: ${diferencia:,.2f}
+            </div>
+            """, unsafe_allow_html=True)
+            
+        st.caption(f"Tecnología utilizada: {origen}")
+
+        # --- TABLA Y EXCEL ---
+        st.subheader("Movimientos Detallados")
+        # Formato visual
+        df_show = df.copy()
+        df_show['Débito'] = df_show['Débito'].apply(lambda x: f"{x:,.2f}" if x > 0 else "-")
+        df_show['Crédito'] = df_show['Crédito'].apply(lambda x: f"{x:,.2f}" if x > 0 else "-")
+        
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+        # Generar Excel
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            # Hoja 1: Resumen
+            resumen = pd.DataFrame({
+                'Concepto': ['Saldo Anterior', 'Créditos', 'Débitos', 'Saldo Calculado', 'Saldo PDF', 'Diferencia'],
+                'Importe': [s_ini, t_cre, t_deb, saldo_calc, s_fin, diferencia]
+            })
+            resumen.to_excel(writer, sheet_name='Conciliacion', index=False)
+            # Hoja 2: Datos
+            df.to_excel(writer, sheet_name='Movimientos', index=False)
+            
+        st.download_button("📥 Descargar Excel Completo", buffer.getvalue(), "conciliacion_aie.xlsx")
+
+    else:
+        st.warning("⚠️ No se pudieron extraer datos. Revisa la calibración en la barra lateral.")

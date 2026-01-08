@@ -154,4 +154,64 @@ with col_config:
 
 if uploaded_file:
     # 1. Procesar
-    x_coords = [x_fecha, x_desc, x_debito
+    x_coords = [x_fecha, x_desc, x_debito, x_credito]
+    df_raw, saldo_detectado, status = procesar_pdf(uploaded_file, x_coords)
+    
+    # Input de saldo siempre visible
+    with col_config:
+        st.divider()
+        saldo_inicial = st.number_input("Saldo Anterior", value=saldo_detectado, step=1000.0)
+
+    # 2. Validar
+    if status != "OK" or df_raw.empty:
+        with col_main:
+            st.warning("⚠️ No se leyeron movimientos con la configuración actual.")
+            st.info("💡 Consejo: Mové los sliders de la izquierda poco a poco hasta que aparezcan los datos en la tabla.")
+            
+            # Mostrar texto crudo para ayudar a ubicar
+            with st.expander("Ver texto del PDF (Ayuda para calibrar)"):
+                with pdfplumber.open(uploaded_file) as pdf:
+                    st.text(pdf.pages[0].extract_text()[:600])
+    else:
+        # 3. Conciliar
+        df_fin, t_cred, t_deb, saldo_fin = verificar_conciliacion(df_raw, saldo_inicial)
+        
+        with col_main:
+            # Métricas
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Saldo Anterior", formatear_moneda_ar(saldo_inicial))
+            m2.metric("Total Créditos", formatear_moneda_ar(t_cred))
+            m3.metric("Total Débitos", formatear_moneda_ar(t_deb))
+            
+            # Color del saldo final
+            if not df_fin[df_fin['Estado'] == 'ERROR'].empty:
+                m4.metric("Saldo Calculado", formatear_moneda_ar(saldo_fin), "Diferencia", delta_color="inverse")
+                st.error("❌ ERROR DE CONCILIACIÓN: El saldo calculado no coincide con el del banco.")
+                
+                # Tabla de errores
+                st.write("Movimientos con diferencias:")
+                err_view = df_fin[df_fin['Estado']=='ERROR'][['Fecha','Descripcion','Saldo_PDF','Saldo_Calculado','Diferencia']].copy()
+                for c in err_view.columns[2:]: err_view[c] = err_view[c].apply(formatear_moneda_ar)
+                st.dataframe(err_view, use_container_width=True)
+            else:
+                m4.metric("Saldo Calculado", formatear_moneda_ar(saldo_fin), "Ok")
+                st.success("✅ Conciliación Perfecta.")
+
+            # Tabla Principal
+            st.subheader("Movimientos Detallados")
+            df_show = df_fin.copy()
+            cols_fmt = ['Debito', 'Credito', 'Saldo_PDF', 'Saldo_Calculado', 'Diferencia']
+            for c in cols_fmt: df_show[c] = df_show[c].apply(formatear_moneda_ar)
+            
+            st.dataframe(df_show, use_container_width=True, height=500)
+            
+            # Descarga Excel
+            buffer = BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                df_fin.to_excel(writer, index=False)
+            
+            st.download_button("📥 Descargar Excel", buffer.getvalue(), "conciliacion_aie.xlsx")
+
+else:
+    # Estado inicial vacio
+    pass

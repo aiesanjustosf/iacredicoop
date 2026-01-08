@@ -6,3 +6,4 @@ xlsxwriter
 pytesseract
 pdf2image
 pillow
+fpdf (pip install fpdf
